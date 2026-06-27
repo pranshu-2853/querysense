@@ -1,0 +1,947 @@
+PROJECT 3 — QUERYSENSE IMPLEMENTATION ROADMAP
+Intelligent SQL Analytics Agent
+Version 1.1 | Architecture-Aligned | AI-Development-Optimized
+===============================================================
+
+TOTAL ESTIMATED TIME: 10–13 weeks
+PHASES: 14 implementation phases + 1 documentation phase
+BUILD STRATEGY: Each phase produces independently testable, committed code.
+                Never start a new phase until previous phase verification passes.
+
+===============================================================
+PHASE 01 — Project Scaffolding & Infrastructure
+===============================================================
+GOAL:
+  Create a compiling, runnable Spring Boot project with all Maven
+  dependencies, three DataSource beans, Docker Compose with two PostgreSQL
+  instances and Redis, Flyway migrations V1–V7, and a passing health endpoint.
+
+ESTIMATED TIME: 3–4 days
+
+DEFINITION OF DONE:
+  - ./mvnw compile -q exits with code 0
+  - docker compose up starts all four services healthy
+  - GET /actuator/health returns {"status":"UP"}
+  - Flyway ran V1–V7: seven tables exist in querysense DB
+  - Analytics DB has querysense_readonly and querysense_introspect roles
+  - Analytics DB has seed schema: orders, order_items, products, customers
+
+FILES INVOLVED:
+  pom.xml
+  mvnw, mvnw.cmd, .mvn/wrapper/maven-wrapper.properties
+  src/main/resources/application.yml
+  src/main/resources/application-local.yml
+  src/main/java/com/querysense/QuerySenseApplication.java
+  src/main/java/com/querysense/config/DataSourceConfig.java
+  src/main/java/com/querysense/config/AsyncConfig.java
+  src/main/java/com/querysense/config/RedisConfig.java
+  src/main/java/com/querysense/config/OpenApiConfig.java
+  src/main/resources/db/migration/V1__create_users.sql
+  src/main/resources/db/migration/V2__create_data_access_groups.sql
+  src/main/resources/db/migration/V3__create_user_group_memberships.sql
+  src/main/resources/db/migration/V4__create_registered_tables.sql
+  src/main/resources/db/migration/V5__create_registered_columns.sql
+  src/main/resources/db/migration/V6__create_table_relationships.sql
+  src/main/resources/db/migration/V7__create_group_table_access.sql
+  docker/postgres-app/init.sql
+  docker/postgres-analytics/init.sql
+  docker/postgres-analytics/seed.sql
+  docker-compose.yml
+  Dockerfile
+  .env.example
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] ./mvnw compile -q passes with no errors
+  [ ] docker compose up — all four services show healthy in logs
+  [ ] curl http://localhost:8080/actuator/health returns {"status":"UP"}
+  [ ] psql -h localhost -p 5432 -U querysense querysense -c "\dt"
+      shows: users, data_access_groups, user_group_memberships,
+             registered_tables, registered_columns, table_relationships,
+             group_table_access
+  [ ] psql -h localhost -p 5433 -U postgres analytics -c "\du"
+      shows: querysense_readonly, querysense_introspect roles
+  [ ] psql -h localhost -p 5433 -U querysense_readonly analytics
+      -c "SELECT count(*) FROM orders" works (returns 0, no error)
+  [ ] psql -h localhost -p 5433 -U querysense_readonly analytics
+      -c "INSERT INTO orders VALUES (...)" fails with permission denied
+  [ ] Flyway history: SELECT * FROM flyway_schema_history in querysense DB
+      shows V1–V7 all with success=true
+
+TESTING CHECKLIST:
+  [ ] No tests in Phase 01 — compilation and Docker health are the tests
+
+COMMON PITFALLS:
+  - Forgetting mvnw in Dockerfile (bare mvn not available in container)
+  - spring.flyway.url set explicitly (breaks Flyway — it must auto-bind to @Primary)
+  - pgvector image used for analytics DB (wrong — analytics uses plain postgres:16-alpine)
+  - Analytics init.sql tries to create vector extension (wrong — only app DB needs it)
+  - Three DataSource beans but only two JdbcTemplate beans (missing introspectJdbcTemplate)
+
+INTERVIEW CONCEPTS LEARNED:
+  - Multi-DataSource Spring Boot configuration
+  - @Primary bean disambiguation
+  - Flyway auto-configuration behavior
+  - Docker Compose health checks and service dependencies
+
+DEPENDENCIES: None (first phase)
+
+===============================================================
+PHASE 02 — Domain Layer (Entities & Repositories)
+===============================================================
+GOAL:
+  Create all JPA entities, enums, and Spring Data JPA repositories
+  for the application database. No services, no controllers yet.
+
+ESTIMATED TIME: 2–3 days
+
+DEFINITION OF DONE:
+  - All 14 entities map correctly to their Flyway-created tables
+  - All 12 repositories compile and are injectable
+  - EntityMappingTest passes with Testcontainers PostgreSQL
+
+FILES INVOLVED:
+  src/main/java/com/querysense/domain/entity/ (14 files)
+  src/main/java/com/querysense/domain/enums/ (4 files)
+  src/main/java/com/querysense/domain/repository/ (12 files)
+  src/test/java/com/querysense/domain/EntityMappingTest.java
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] ./mvnw compile -q passes
+  [ ] ./mvnw test -pl . -Dtest=EntityMappingTest passes
+  [ ] All entities use FetchType.LAZY on @ManyToOne (grep the code)
+  [ ] No Lombok annotations anywhere (grep for @Data, @Builder, @Getter)
+  [ ] All PKs use UUID type (grep for @Id @GeneratedValue)
+  [ ] JobStatus enum has: PENDING, PROCESSING, COMPLETED, FAILED, CACHED, REJECTED
+  [ ] QueryIntent enum has: AGGREGATION, RANKING, FILTER, TREND, COMPARISON
+
+TESTING CHECKLIST:
+  [ ] EntityMappingTest: @DataJpaTest with Testcontainers pgvector image
+  [ ] Test saves and retrieves each entity type
+  [ ] Test no LazyInitializationException when loading QueryJob without joining QueryResult
+
+COMMON PITFALLS:
+  - EAGER fetch type causing N+1 queries (always LAZY)
+  - Missing @Column(columnDefinition="uuid") on UUID fields (PostgreSQL needs this)
+  - Using LocalDateTime instead of OffsetDateTime for TIMESTAMPTZ columns
+  - Bidirectional relationships causing JSON serialization infinite loops (avoid them)
+  - JPA entities with no-arg constructor missing (JPA requires it — add protected no-arg constructor)
+
+INTERVIEW CONCEPTS LEARNED:
+  - JPA entity mapping best practices
+  - FetchType.LAZY vs EAGER tradeoffs
+  - Spring Data JPA repository method naming conventions
+  - UUID primary keys in PostgreSQL with JPA
+
+DEPENDENCIES: Phase 01
+
+===============================================================
+PHASE 03 — Security Layer (JWT + Spring Security)
+===============================================================
+GOAL:
+  Full JWT authentication. Register/login work. All other endpoints
+  return 401 without valid JWT.
+
+ESTIMATED TIME: 2–3 days
+
+DEFINITION OF DONE:
+  - POST /api/v1/auth/register → 201 + tokens
+  - POST /api/v1/auth/login → 200 + tokens
+  - GET /api/v1/queries (no token) → 401
+  - GET /api/v1/queries (invalid token) → 401
+  - GET /actuator/health (no token) → 200
+  - JwtTokenProviderTest passes
+
+FILES INVOLVED:
+  src/main/java/com/querysense/security/JwtTokenProvider.java
+  src/main/java/com/querysense/security/JwtAuthenticationFilter.java
+  src/main/java/com/querysense/security/UserPrincipal.java
+  src/main/java/com/querysense/config/SecurityConfig.java
+  src/main/java/com/querysense/service/AuthService.java
+  src/main/java/com/querysense/api/controller/AuthController.java
+  src/main/java/com/querysense/api/dto/request/RegisterRequest.java
+  src/main/java/com/querysense/api/dto/request/LoginRequest.java
+  src/main/java/com/querysense/api/dto/response/AuthResponse.java
+  src/main/java/com/querysense/api/exception/GlobalExceptionHandler.java
+  src/main/java/com/querysense/api/exception/QueryRejectionException.java
+  src/main/java/com/querysense/api/exception/SchemaNotFoundException.java
+  src/main/java/com/querysense/api/exception/RateLimitExceededException.java
+  src/main/resources/db/migration/V20__create_refresh_tokens.sql
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] POST /api/v1/auth/register with { email, password } returns 201 + { accessToken, refreshToken, userId }
+  [ ] POST /api/v1/auth/login returns 200 + tokens
+  [ ] GET /api/v1/queries without Authorization header returns 401
+  [ ] GET /api/v1/queries with Authorization: Bearer <expired_token> returns 401
+  [ ] GET /api/v1/queries with Authorization: Bearer <valid_token> returns 200 (empty list)
+  [ ] GET /actuator/health returns 200 without any token
+  [ ] POST /api/v1/auth/register with duplicate email returns 409
+  [ ] Access token TTL is 15 minutes (verify by decoding JWT on jwt.io)
+  [ ] Passwords are stored as BCrypt hashes in DB (verify in psql)
+
+TESTING CHECKLIST:
+  [ ] JwtTokenProviderTest: generateToken, validateToken (valid), validateToken (expired), validateToken (invalid signature), extractUserId
+  [ ] AuthControllerIntegrationTest: register success, login success, login wrong password → 401, duplicate register → 409
+
+COMMON PITFALLS:
+  - SecurityConfig not disabling CSRF for stateless API (causes 403 on POST)
+  - Actuator health endpoint blocked by security (must be explicitly permitted)
+  - JwtAuthenticationFilter calling chain.doFilter() even when token is invalid (must return early)
+  - @EnableMethodSecurity missing in SecurityConfig (needed for @PreAuthorize in Phase 04)
+  - BCryptPasswordEncoder not declared as @Bean (AuthService cannot inject it)
+
+INTERVIEW CONCEPTS LEARNED:
+  - Stateless JWT authentication vs session-based
+  - Spring Security filter chain order
+  - BCrypt password hashing
+  - RS256 vs HS256 for JWT signing
+  - Refresh token rotation pattern
+
+DEPENDENCIES: Phase 02
+
+===============================================================
+PHASE 04 — Schema Registry & Introspection
+===============================================================
+GOAL:
+  Schema discovery from analytics DB, schema registry CRUD, admin API
+  for schema management. After this phase, admins can trigger schema sync,
+  whitelist tables, and manage access groups.
+
+ESTIMATED TIME: 2–3 days
+
+DEFINITION OF DONE:
+  - POST /api/v1/schema/sync discovers all analytics DB tables
+  - registered_tables has 4 rows after sync (orders, products, customers, order_items)
+  - All tables have is_whitelisted=false after sync
+  - SchemaIntrospectionTest passes (confirms introspectJdbcTemplate, not appDataSource)
+
+FILES INVOLVED:
+  src/main/java/com/querysense/schema/introspection/SchemaIntrospector.java
+  src/main/java/com/querysense/schema/introspection/SchemaIntrospectionResult.java
+  src/main/java/com/querysense/service/SchemaService.java
+  src/main/java/com/querysense/api/controller/SchemaController.java
+  src/main/java/com/querysense/api/controller/AccessGroupController.java
+  src/main/java/com/querysense/service/AccessGroupService.java
+  src/main/java/com/querysense/api/dto/response/SchemaTableResponse.java
+  src/main/java/com/querysense/api/dto/request/TableDescriptionRequest.java
+  src/test/java/com/querysense/schema/SchemaIntrospectionTest.java
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] POST /api/v1/schema/sync (ADMIN token) returns 200
+  [ ] SELECT count(*) FROM registered_tables returns 4
+  [ ] SELECT count(*) FROM registered_columns is > 0
+  [ ] All registered_tables have is_whitelisted = false
+  [ ] PATCH /api/v1/schema/tables/{id}/whitelist toggles is_whitelisted
+  [ ] PUT /api/v1/schema/tables/{id}/description updates description column
+  [ ] POST /api/v1/schema/columns/{id}/pii toggles is_pii
+  [ ] POST /api/v1/groups creates a data_access_group
+  [ ] POST /api/v1/groups/{id}/tables adds a row to group_table_access
+  [ ] Non-ADMIN token on /api/v1/schema/sync returns 403
+
+TESTING CHECKLIST:
+  [ ] SchemaIntrospectionTest: Testcontainers analytics DB, call SchemaIntrospector.introspect(), verify 4 tables discovered, verify FK relationships discovered
+  [ ] SchemaIntrospectionTest: verify introspectJdbcTemplate connects to analytics DB (not app DB) by checking database name
+
+COMMON PITFALLS:
+  - SchemaIntrospector accidentally injecting appDataSource JdbcTemplate (must use @Qualifier("introspectJdbcTemplate"))
+  - Flyway trying to run migrations against analytics DB connection (prevented by not configuring flyway.url)
+  - Schema sync not updating last_synced_at on existing tables (must upsert, not insert)
+  - Missing @EnableMethodSecurity causing @PreAuthorize to silently pass all requests
+
+INTERVIEW CONCEPTS LEARNED:
+  - information_schema as the standard PostgreSQL metadata interface
+  - Role-based access control at both application and database level
+  - Upsert patterns in Spring Data JPA (save() behavior on existing entity)
+  - Admin vs user endpoint separation
+
+DEPENDENCIES: Phase 03
+
+===============================================================
+PHASE 05 — Flyway Migrations V8–V19 & pgvector Setup
+===============================================================
+GOAL:
+  Add all remaining Flyway migrations: query job tables, LLM logging,
+  golden dataset, evaluation tables, pgvector extension and three
+  embedding tables with HNSW indexes.
+
+ESTIMATED TIME: 1–2 days
+
+DEFINITION OF DONE:
+  - docker compose down -v && docker compose up runs V1–V19 successfully
+  - 19 tables exist in querysense DB
+  - table_embeddings has a vector(1536) column
+  - HNSW index exists on all three embedding tables
+  - pgvector extension is active: SELECT * FROM pg_extension WHERE extname = 'vector' returns a row
+
+FILES INVOLVED:
+  src/main/resources/db/migration/V8__create_query_jobs.sql
+  src/main/resources/db/migration/V9__create_query_results.sql
+  src/main/resources/db/migration/V10__create_sql_generation_attempts.sql
+  src/main/resources/db/migration/V11__create_llm_call_logs.sql
+  src/main/resources/db/migration/V12__create_golden_queries.sql
+  src/main/resources/db/migration/V13__create_evaluation_runs.sql
+  src/main/resources/db/migration/V14__create_evaluation_results.sql
+  src/main/resources/db/migration/V15__create_pgvector_extension.sql
+  src/main/resources/db/migration/V16__create_table_embeddings.sql
+  src/main/resources/db/migration/V17__create_column_embeddings.sql
+  src/main/resources/db/migration/V18__create_question_embeddings.sql
+  src/main/resources/db/migration/V19__create_relational_indexes.sql
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] docker compose down -v && docker compose up — Flyway shows 19 migrations applied
+  [ ] SELECT count(*) FROM information_schema.tables WHERE table_schema='public' = 19
+  [ ] \d table_embeddings shows embedding column as vector(1536)
+  [ ] \d column_embeddings shows embedding column as vector(1536)
+  [ ] SELECT indexname FROM pg_indexes WHERE tablename='table_embeddings' shows HNSW index
+  [ ] SELECT * FROM pg_extension WHERE extname='vector' returns a row
+  [ ] All foreign key constraints exist (SELECT * FROM information_schema.referential_constraints)
+
+TESTING CHECKLIST:
+  [ ] No new code tests in this phase — migration correctness is the test
+  [ ] Update EntityMappingTest to include the new entities (QueryJob, QueryResult, LlmCallLog, etc.)
+
+COMMON PITFALLS:
+  - V15 trying to CREATE EXTENSION vector on postgres-analytics DB (wrong — only app DB has pgvector image)
+  - HNSW index CREATE failing because vector extension not yet enabled (V15 must come before V16–V18)
+  - vector(1536) column type not recognized if pgvector extension not installed in Docker image
+
+INTERVIEW CONCEPTS LEARNED:
+  - pgvector HNSW vs IVFFlat index tradeoffs
+  - Why HNSW is better for small-to-medium datasets (online indexing, no training phase)
+  - Flyway migration ordering and naming conventions
+  - PostgreSQL extensions system
+
+DEPENDENCIES: Phase 04
+
+===============================================================
+PHASE 06 — AI Clients & Embedding Service
+===============================================================
+GOAL:
+  Implement LLMClient (Spring AI 1.0.x), EmbeddingClientWrapper,
+  SchemaEmbeddingService, and DdlReconstructionService.
+  After this phase, running schema sync also generates and stores embeddings.
+
+ESTIMATED TIME: 3–4 days
+
+DEFINITION OF DONE:
+  - LLMClient instantiates without errors
+  - Schema sync generates embeddings for all whitelisted tables and columns
+  - table_embeddings has rows after sync
+  - DdlReconstructionService produces readable DDL string from mock schema context
+  - LLMClient unit tests pass with mocked ChatClient.Builder
+
+FILES INVOLVED:
+  src/main/java/com/querysense/ai/client/LLMClient.java
+  src/main/java/com/querysense/ai/client/EmbeddingClientWrapper.java
+  src/main/java/com/querysense/ai/model/SQLGenerationResult.java
+  src/main/java/com/querysense/ai/model/ExplanationResult.java
+  src/main/java/com/querysense/config/SpringAIConfig.java
+  src/main/java/com/querysense/schema/embedding/SchemaEmbeddingService.java
+  src/main/java/com/querysense/schema/embedding/DdlReconstructionService.java
+  src/main/resources/prompts/sql-generation-system-prompt.st
+  src/main/resources/prompts/result-explanation-system-prompt.st
+  src/test/java/com/querysense/ai/LLMClientTest.java
+  src/test/java/com/querysense/schema/SchemaEmbeddingServiceTest.java
+  src/test/java/com/querysense/schema/DdlReconstructionServiceTest.java
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] POST /api/v1/schema/sync (with real OPENAI_API_KEY in .env) → runs without error
+  [ ] SELECT count(*) FROM table_embeddings > 0 after sync
+  [ ] SELECT count(*) FROM column_embeddings > 0 after sync
+  [ ] SELECT length(embed_content::text) FROM table_embeddings LIMIT 1 > 50 (content is meaningful)
+  [ ] LLMClient does not inject ChatClient directly (grep for "@Autowired" near ChatClient — must be zero)
+
+TESTING CHECKLIST:
+  [ ] LLMClientTest: mock ChatClient.Builder, verify generateSql() calls .entity(SQLGenerationResult.class)
+  [ ] LLMClientTest: verify streamExplanation() calls .stream().content()
+  [ ] SchemaEmbeddingServiceTest: mock EmbeddingClientWrapper, verify embed_content built correctly for a table with 3 columns
+  [ ] DdlReconstructionServiceTest: given RetrievedSchemaContext with 2 tables, verify DDL contains both table names and all column names
+
+COMMON PITFALLS:
+  - Using ChatClient as an injectable @Bean instead of ChatClient.Builder
+  - Spring AI 1.0.x API: .call().entity() vs old .call().content() — must use .entity() for structured output
+  - OpenAI embedding dimensions: text-embedding-3-small is 1536 — mismatch with vector(1536) column causes insert failure
+  - pgvector JDBC insert: float[] from embedding model must be cast correctly for PostgreSQL — use ::vector cast in the SQL
+
+INTERVIEW CONCEPTS LEARNED:
+  - Spring AI 1.0.x ChatClient.Builder pattern vs direct injection
+  - Structured LLM output with Java records
+  - Embedding models and vector dimensions
+  - pgvector JDBC insertion pattern
+
+DEPENDENCIES: Phase 05
+
+===============================================================
+PHASE 07 — Pipeline Infrastructure
+===============================================================
+GOAL:
+  PipelineContext, TextToSqlPipelineExecutor, SseEmitterRegistry,
+  ContextBudgetManager, CorrectionPromptBuilder, RetryPolicy,
+  QuestionHasher, and QueryOrchestrationService skeleton.
+  No stage implementations yet.
+
+ESTIMATED TIME: 2–3 days
+
+DEFINITION OF DONE:
+  - TextToSqlPipelineExecutor dispatches async via @Async("pipelineExecutor")
+  - SseEmitterRegistry unit tests pass
+  - POST /api/v1/queries returns jobId (pipeline is dispatched but stages are stubs)
+  - SSE stream opens without error
+
+FILES INVOLVED:
+  src/main/java/com/querysense/pipeline/context/PipelineContext.java
+  src/main/java/com/querysense/pipeline/context/ContextBudgetManager.java
+  src/main/java/com/querysense/pipeline/TextToSqlPipelineExecutor.java
+  src/main/java/com/querysense/pipeline/retry/CorrectionPromptBuilder.java
+  src/main/java/com/querysense/pipeline/retry/RetryPolicy.java
+  src/main/java/com/querysense/infrastructure/sse/SseEmitterRegistry.java
+  src/main/java/com/querysense/infrastructure/hashing/QuestionHasher.java
+  src/main/java/com/querysense/service/QueryOrchestrationService.java
+  src/test/java/com/querysense/infrastructure/SseEmitterRegistryTest.java
+  src/test/java/com/querysense/pipeline/TextToSqlPipelineExecutorTest.java
+  src/test/java/com/querysense/pipeline/ContextBudgetManagerTest.java
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] POST /api/v1/queries (valid token) returns 202 + { jobId, status: "PENDING" }
+  [ ] GET /api/v1/queries/{jobId}/stream opens SSE connection (200, text/event-stream content type)
+  [ ] DB: SELECT status FROM query_jobs WHERE id = '{jobId}' eventually shows PROCESSING
+  [ ] Verify pipelineExecutor is used: check logs for "pipeline-1" thread name in pipeline execution
+  [ ] SseEmitter timeout is 120 seconds (verify SseEmitterRegistry source)
+
+TESTING CHECKLIST:
+  [ ] SseEmitterRegistryTest: register → sendEvent → complete, verify no exceptions
+  [ ] SseEmitterRegistryTest: sendEvent when no emitter registered → silently passes (no exception)
+  [ ] TextToSqlPipelineExecutorTest: all 8 stages mocked, verify execution order (InOrder Mockito)
+  [ ] TextToSqlPipelineExecutorTest: cache hit path → stage 2 sets cacheHit=true → stages 3–7 never called
+  [ ] ContextBudgetManagerTest: 3000-token DDL truncated to ≤2500 tokens; 2000-token DDL unchanged
+
+COMMON PITFALLS:
+  - SseEmitter registered AFTER pipeline dispatched (race condition — register first)
+  - @Async not working because @EnableAsync missing in AsyncConfig
+  - CompletableFuture<Void> return type required for @Async void methods to propagate exceptions
+  - PipelineContext constructor not setting all required fields (null SSE emitter causes NPE in stages)
+
+INTERVIEW CONCEPTS LEARNED:
+  - @Async with bounded thread pool executors
+  - SSE (Server-Sent Events) lifecycle in Spring
+  - ConcurrentHashMap for thread-safe emitter registry
+  - Pipeline pattern vs chain of responsibility
+
+DEPENDENCIES: Phase 06
+
+===============================================================
+PHASE 08 — Pipeline Stages 1–3 (Pre-Processing, Cache, Schema Retrieval)
+===============================================================
+GOAL:
+  Pre-processing (normalize, temporal extraction, intent classification,
+  injection guard), semantic cache (exact + semantic), and schema
+  retrieval (DDL pruning). After this phase, the pipeline runs through
+  stages 1–3 with real logic. Stage 4 is a stub.
+
+ESTIMATED TIME: 3–4 days
+
+DEFINITION OF DONE:
+  - TemporalExtractorTest passes (all 9 phrases)
+  - IntentClassifierTest passes (5 intent classes, 3 examples each)
+  - InjectionGuardTest passes
+  - Semantic cache exact hit returns CACHED status
+  - Schema retrieval returns RetrievedSchemaContext with tables and columns
+
+FILES INVOLVED:
+  src/main/java/com/querysense/preprocessing/QueryNormalizer.java
+  src/main/java/com/querysense/preprocessing/TemporalExtractor.java
+  src/main/java/com/querysense/preprocessing/IntentClassifier.java
+  src/main/java/com/querysense/preprocessing/InjectionGuard.java
+  src/main/java/com/querysense/pipeline/stage/QueryPreProcessingStage.java
+  src/main/java/com/querysense/ai/cache/ExactQueryCacheManager.java
+  src/main/java/com/querysense/ai/cache/SemanticQueryCacheManager.java
+  src/main/java/com/querysense/pipeline/stage/SemanticCacheStage.java
+  src/main/java/com/querysense/schema/retrieval/SemanticSchemaRetriever.java
+  src/main/java/com/querysense/schema/retrieval/RetrievedSchemaContext.java
+  src/main/java/com/querysense/pipeline/stage/SchemaRetrievalStage.java
+  src/test/java/com/querysense/preprocessing/TemporalExtractorTest.java
+  src/test/java/com/querysense/preprocessing/IntentClassifierTest.java
+  src/test/java/com/querysense/preprocessing/InjectionGuardTest.java
+  src/test/java/com/querysense/pipeline/SemanticCacheStageTest.java
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] Submit question "top 10 products by revenue last quarter" → logs show temporal resolution to concrete dates
+  [ ] Submit question "DROP TABLE orders" → job status = REJECTED immediately, rejection_reason contains INJECTION
+  [ ] Submit question "total revenue by month" → intent_class = TREND in query_jobs table
+  [ ] Submit same question twice → second job has cache_hit = true in query_jobs
+  [ ] Schema retrieval stage logs show tables retrieved from pgvector (with similarity scores)
+  [ ] Reconstructed DDL in logs contains only relevant tables (not all 4)
+
+TESTING CHECKLIST:
+  [ ] TemporalExtractorTest: "last quarter" → correct Q start/end dates for current date
+  [ ] TemporalExtractorTest: "past 30 days" → (now - 30 days, now)
+  [ ] TemporalExtractorTest: "today" → (today, today)
+  [ ] TemporalExtractorTest: unknown phrase → TemporalContext with null dates, phrase preserved
+  [ ] IntentClassifierTest: "top 10 products" → RANKING
+  [ ] IntentClassifierTest: "total revenue" → AGGREGATION
+  [ ] IntentClassifierTest: "orders where status = cancelled" → FILTER
+  [ ] InjectionGuardTest: "DROP TABLE orders" → true
+  [ ] InjectionGuardTest: "total orders by status" → false
+  [ ] SemanticCacheStageTest: ExactQueryCacheManager returns hit → cacheHit=true in context
+
+COMMON PITFALLS:
+  - TemporalExtractor using Calendar instead of java.time (use LocalDate, Month, etc.)
+  - "Last quarter" calculation off-by-one at quarter boundaries
+  - Exact cache key uses original question (not normalized) — use normalized + lowercased for consistent hashing
+  - SemanticQueryCacheManager using wrong JdbcTemplate (must use appDataSource — pgvector is in app DB)
+  - pgvector query syntax: $1::vector (the ::vector cast is required for JDBC parameter binding)
+
+INTERVIEW CONCEPTS LEARNED:
+  - Semantic vs exact caching tradeoffs
+  - pgvector cosine similarity query structure
+  - Why 0.93 threshold for SQL (vs lower threshold for general RAG)
+  - Access group filtering on semantic cache results (security concept)
+  - Temporal expression resolution before LLM call (determinism)
+
+DEPENDENCIES: Phase 07
+
+===============================================================
+PHASE 09 — Pipeline Stages 4–6 (Generation, Validation, Execution)
+===============================================================
+GOAL:
+  SQL generation (Spring AI structured output), AST validation
+  (JSQLParser with all 7 rules), and safe query execution (read-only
+  role, timeout enforcement). This is the safety-critical phase.
+
+ESTIMATED TIME: 4–5 days
+
+DEFINITION OF DONE:
+  - ASTValidatorTest: 20+ cases all pass
+  - SafeQueryExecutor integration test passes
+  - Full pipeline runs end-to-end with real OpenAI API call (manually tested)
+  - Generated SQL is validated before execution every time
+  - Non-whitelisted table reference correctly rejected
+
+FILES INVOLVED:
+  src/main/java/com/querysense/ai/prompt/SqlGenerationPromptTemplate.java
+  src/main/java/com/querysense/ai/prompt/ResultExplanationPromptTemplate.java
+  src/main/java/com/querysense/pipeline/stage/SqlGenerationStage.java
+  src/main/java/com/querysense/validation/ASTValidator.java
+  src/main/java/com/querysense/validation/ValidationResult.java
+  src/main/java/com/querysense/validation/WhitelistEnforcer.java
+  src/main/java/com/querysense/validation/SqlLimitInjector.java
+  src/main/java/com/querysense/pipeline/stage/ASTValidationStage.java
+  src/main/java/com/querysense/execution/SafeQueryExecutor.java
+  src/main/java/com/querysense/execution/QueryExecutionResult.java
+  src/main/java/com/querysense/execution/ResultSetMapper.java
+  src/main/java/com/querysense/pipeline/stage/QueryExecutionStage.java
+  src/test/java/com/querysense/validation/ASTValidatorTest.java
+  src/test/java/com/querysense/validation/SqlLimitInjectorTest.java
+  src/test/java/com/querysense/execution/SafeQueryExecutorTest.java
+  src/test/java/com/querysense/pipeline/CorrectionLoopTest.java
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] Submit "show me total orders by status" → generated SQL in query_results is a valid SELECT
+  [ ] Inspect generated_sql in DB: no SELECT *, has explicit column names, has LIMIT
+  [ ] Insert a test golden query where expected SQL has DROP TABLE — verify it never reaches execution
+  [ ] query_jobs.retry_count = 0 for clean first-attempt success
+  [ ] query_jobs.retry_count = 1 or 2 for a question that needed correction (check logs)
+  [ ] Verify analyticsJdbcTemplate query fails with permission denied if tested with a DML statement manually in psql
+
+TESTING CHECKLIST:
+  [ ] ASTValidatorTest (20+ cases):
+      - Valid SELECT from whitelisted table → passes
+      - INSERT INTO orders → fails NON_SELECT
+      - DELETE FROM orders → fails NON_SELECT
+      - DROP TABLE orders → fails NON_SELECT
+      - SELECT * FROM orders → fails SELECT_STAR
+      - SELECT id FROM unknown_table → fails TABLE_NOT_WHITELISTED
+      - SELECT id FROM information_schema.tables → fails SYSTEM_TABLE_ACCESS
+      - SELECT id FROM orders; SELECT id FROM products → fails MULTIPLE_STATEMENTS
+      - SELECT id FROM orders -- comment → fails COMMENT_INJECTION
+      - SELECT id FROM orders /* comment */ → fails COMMENT_INJECTION
+      - Valid JOIN between two whitelisted tables → passes
+      - Valid subquery from whitelisted tables → passes
+      - SELECT id FROM orders WHERE id IN (SELECT order_id FROM order_items) → passes
+  [ ] SqlLimitInjectorTest:
+      - No LIMIT → LIMIT 1000 added
+      - LIMIT 500 present → unchanged
+      - LIMIT 2000 present → replaced with 1000
+  [ ] SafeQueryExecutorTest (Testcontainers analytics DB):
+      - Valid SELECT → success, rows returned
+      - Query exceeding timeout → TIMEOUT result
+  [ ] CorrectionLoopTest: mock LLMClient returning invalid SQL twice then valid SQL → verifies 3 LLM calls, correct SQL on third
+
+COMMON PITFALLS:
+  - JSQLParser failing to parse valid PostgreSQL-specific syntax (array operators, PERCENTILE_CONT) → log the error but don't crash; treat as PARSE_ERROR and retry
+  - SqlLimitInjector using string concat ("SELECT ... LIMIT 1000") → must use JSQLParser AST API
+  - SafeQueryExecutor using wrong JdbcTemplate (must use @Qualifier("analyticsJdbcTemplate"))
+  - WhitelistEnforcer cache not refreshed after schema sync → SchemaService must call WhitelistEnforcer.refresh() after sync
+  - Correction prompt not including the whitelisted table list → LLM cannot fix TABLE_NOT_WHITELISTED errors without knowing valid tables
+
+INTERVIEW CONCEPTS LEARNED:
+  - Why JSQLParser over regex for SQL validation (SQL is not a regular language)
+  - AST-level SQL inspection vs string matching
+  - Defense in depth: JSQLParser + read-only role = two independent safety layers
+  - Correction loop pattern in AI pipelines (analogous to Resilience4j retry for LLMs)
+  - Triple-layer timeout enforcement
+
+DEPENDENCIES: Phase 08
+
+===============================================================
+PHASE 10 — Pipeline Stages 7–8 (Explanation, Caching, Audit)
+===============================================================
+GOAL:
+  SSE-streamed result explanation (GPT-4o-mini), caching and audit
+  writes, RateLimitService. Full end-to-end pipeline complete.
+
+ESTIMATED TIME: 2–3 days
+
+DEFINITION OF DONE:
+  - Full end-to-end integration test passes (Phase 10 integration test)
+  - SSE stream delivers EXPLANATION_TOKEN events progressively
+  - query_results row exists after job completes
+  - question_embeddings row exists after job completes
+  - Redis has exact cache entry after job completes
+  - Rate limit test: 21st request → 429
+
+FILES INVOLVED:
+  src/main/java/com/querysense/pipeline/stage/ResultExplanationStage.java
+  src/main/java/com/querysense/pipeline/stage/CachingAndAuditStage.java
+  src/main/java/com/querysense/service/AuditService.java
+  src/main/java/com/querysense/service/RateLimitService.java
+  src/test/java/com/querysense/integration/FullPipelineIntegrationTest.java
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] Submit question, open SSE stream → see events: CACHE_LOOKUP, SCHEMA_RETRIEVAL, SQL_GENERATION, AST_VALIDATION, QUERY_EXECUTION, EXPLANATION_START, EXPLANATION_TOKEN (multiple), EXPLANATION_COMPLETE, COMPLETED
+  [ ] After COMPLETED, check DB: query_jobs.status = COMPLETED
+  [ ] After COMPLETED, check DB: query_results has one row with explanation text
+  [ ] After COMPLETED, check DB: question_embeddings has one row for the job
+  [ ] After COMPLETED, check Redis: GET query:exact:{hash} returns the cached result
+  [ ] Submit same question again → SSE shows only CACHE_LOOKUP → COMPLETED (no SQL_GENERATION event)
+  [ ] Send 21 requests with same user token → 21st returns 429
+  [ ] If client disconnects mid-stream (close browser tab), job still completes in DB (audit correctness)
+
+TESTING CHECKLIST:
+  [ ] FullPipelineIntegrationTest (mocked LLMClient):
+      - Submit question → wait for COMPLETED event
+      - Verify event order in SSE stream
+      - Verify DB state after completion
+      - Verify Redis cache entry after completion
+  [ ] AuditServiceTest: verify markJobFailed sets status=FAILED with correct rejection_reason
+  [ ] RateLimitServiceTest: mock RedisTemplate, verify 429 on 21st call within same window
+
+COMMON PITFALLS:
+  - Flux<String> from streamExplanation() not fully consumed before Stage 8 starts (use blockLast() or .collectList().block() in test, but subscribe() + Semaphore in production)
+  - CachingAndAuditStage calling sseEmitterRegistry.complete() before writing to DB (audit must complete first)
+  - Question embedding inserted with wrong groupId (must match the query job's groupId for access group filtering)
+  - AuditService not @Transactional causing partial audit writes on error
+
+INTERVIEW CONCEPTS LEARNED:
+  - Reactive streaming with Project Reactor (Flux) in a non-reactive application
+  - Semantic cache write-through pattern
+  - Audit log immutability enforcement
+  - Redis Lua scripts for atomic rate limiting
+
+DEPENDENCIES: Phase 09
+
+===============================================================
+PHASE 11 — Query API Controller & History
+===============================================================
+GOAL:
+  QueryController with all four endpoints. Users can submit queries,
+  poll status, open SSE streams, and view query history.
+
+ESTIMATED TIME: 1–2 days
+
+DEFINITION OF DONE:
+  - POST /api/v1/queries → 202 + jobId
+  - GET /api/v1/queries/{jobId} → full result when COMPLETED
+  - GET /api/v1/queries/{jobId}/stream → SSE stream
+  - GET /api/v1/queries → paginated list
+  - Authorization enforcement: users see only their own jobs
+
+FILES INVOLVED:
+  src/main/java/com/querysense/api/controller/QueryController.java
+  src/main/java/com/querysense/api/dto/request/QueryRequest.java
+  src/main/java/com/querysense/api/dto/response/QueryJobResponse.java
+  src/main/java/com/querysense/api/dto/response/QueryResultResponse.java
+  src/test/java/com/querysense/api/QueryControllerTest.java
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] POST /api/v1/queries with empty question → 400 with validation error
+  [ ] POST /api/v1/queries with 501-char question → 400 with validation error
+  [ ] GET /api/v1/queries/{jobId} with job belonging to another user → 403
+  [ ] GET /api/v1/queries → returns { content: [...], totalElements: N, page: 0, size: 20 }
+  [ ] GET /api/v1/queries?page=0&size=5 → returns at most 5 results
+
+TESTING CHECKLIST:
+  [ ] QueryControllerTest (MockMvc): empty question → 400, valid question → 202, other user's job → 403
+  [ ] QueryControllerTest: pagination parameters applied correctly
+
+COMMON PITFALLS:
+  - GET /api/v1/queries/{jobId}/stream registering emitter AFTER dispatching pipeline (race condition — emitter must be registered first, THEN pipeline dispatched)
+  - QueryJobResponse including raw DB entity (must use DTO mapping)
+  - GET /api/v1/queries returning jobs from all users (must filter by authenticated user)
+
+INTERVIEW CONCEPTS LEARNED:
+  - SSE (Server-Sent Events) vs WebSocket choice for one-directional streaming
+  - SseEmitter in Spring MVC (blocking vs reactive)
+  - Pagination with Spring Data JPA Pageable
+  - Fine-grained authorization (row-level access control)
+
+DEPENDENCIES: Phase 10
+
+===============================================================
+PHASE 12 — Evaluation Framework
+===============================================================
+GOAL:
+  Golden dataset management (CRUD), evaluation runner (runs full
+  pipeline against golden dataset, measures accuracy), Python offline
+  evaluation script for CI.
+
+ESTIMATED TIME: 2–3 days
+
+DEFINITION OF DONE:
+  - POST /api/v1/evaluation/golden adds test cases
+  - POST /api/v1/evaluation/run returns accuracy_pct
+  - GET /api/v1/evaluation/runs/{id} shows per-case results
+  - evaluation/evaluate.py runs against local server with accuracy output
+  - golden_dataset.json has at least 10 test cases
+
+FILES INVOLVED:
+  src/main/java/com/querysense/service/EvaluationService.java
+  src/main/java/com/querysense/api/controller/EvaluationController.java
+  src/main/java/com/querysense/api/dto/request/GoldenQueryRequest.java
+  src/main/java/com/querysense/api/dto/response/EvaluationRunResponse.java
+  evaluation/evaluate.py
+  evaluation/sql_similarity.py
+  evaluation/golden_dataset.json
+  evaluation/requirements.txt
+  src/test/java/com/querysense/integration/EvaluationIntegrationTest.java
+
+SAMPLE GOLDEN DATASET QUESTIONS (for seed):
+  1. "Show me total revenue by product category" [AGGREGATION]
+  2. "Top 10 customers by total spending last month" [RANKING]
+  3. "How many orders were placed today" [AGGREGATION]
+  4. "List all orders with status cancelled" [FILTER]
+  5. "Daily order count for the past 30 days" [TREND]
+  6. "Which product had the highest revenue last quarter" [RANKING]
+  7. "Average order value by customer" [AGGREGATION]
+  8. "Orders placed by customers in the last 7 days" [FILTER]
+  9. "Monthly revenue trend this year" [TREND]
+  10. "Total number of distinct customers who placed at least one order" [AGGREGATION]
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] POST /api/v1/evaluation/golden (ADMIN) → creates golden query
+  [ ] POST /api/v1/evaluation/run (ADMIN) → returns { accuracy_pct, passed, failed, totalCases }
+  [ ] GET /api/v1/evaluation/runs/{id} → shows per-case passed/failed/failure_reason
+  [ ] python evaluation/evaluate.py --api-url http://localhost:8080 → prints accuracy table
+  [ ] Accuracy on 10 sample questions is above 50% (basic sanity check)
+
+TESTING CHECKLIST:
+  [ ] EvaluationIntegrationTest: run evaluation with 3 golden queries, verify EvaluationRun created with correct passed/failed counts
+
+COMMON PITFALLS:
+  - EvaluationService running pipeline asynchronously during evaluation (must be synchronous for deterministic results)
+  - SQL comparison being case-sensitive (normalize both to lowercase before comparing)
+  - evaluate.py not polling for COMPLETED status before comparing (pipeline is async — must poll GET /queries/{jobId})
+
+INTERVIEW CONCEPTS LEARNED:
+  - Regression evaluation in AI systems (the "how do you know it works" answer)
+  - SQL structural comparison vs string equality
+  - Golden datasets as a quality gate
+  - Evaluation as a CI gate (fail build if accuracy < 80%)
+
+DEPENDENCIES: Phase 11
+
+===============================================================
+PHASE 13 — Observability & Structured Logging
+===============================================================
+GOAL:
+  AnalyticsController (cost and accuracy endpoints), structured JSON
+  logging with Logback, per-stage structured log entries with jobId.
+
+ESTIMATED TIME: 1–2 days
+
+DEFINITION OF DONE:
+  - GET /api/v1/analytics/cost returns daily cost breakdown
+  - GET /api/v1/analytics/accuracy returns daily accuracy stats
+  - Logs include jobId across all stage entries for a single pipeline run
+  - Production profile uses JSON log format
+
+FILES INVOLVED:
+  src/main/java/com/querysense/api/controller/AnalyticsController.java
+  src/main/resources/logback-spring.xml
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] GET /api/v1/analytics/cost (ADMIN) returns JSON with estimated_cost_usd field
+  [ ] GET /api/v1/analytics/accuracy (ADMIN) returns JSON with cache_hit_pct field
+  [ ] Log a pipeline run and grep for the jobId — see it in: pre-processing, schema retrieval, SQL generation, AST validation, execution, explanation, caching stages
+  [ ] SPRING_PROFILES_ACTIVE=prod → logs are JSON format (verify with docker compose)
+
+TESTING CHECKLIST:
+  [ ] No new unit tests — manual verification is sufficient
+
+COMMON PITFALLS:
+  - AnalyticsController using JPA instead of JdbcTemplate for GROUP BY queries (use JdbcTemplate for analytical queries)
+  - logback-spring.xml syntax error crashing the application on startup
+  - JSON logs using non-standard field names (timestamp not @timestamp, message not msg — pick one and be consistent)
+
+INTERVIEW CONCEPTS LEARNED:
+  - LLM cost attribution per model per call type
+  - Structured logging for AI observability
+  - The business case for semantic caching (cost reduction demonstrated by the analytics endpoint)
+  - Cache hit rate as an operational metric
+
+DEPENDENCIES: Phase 12
+
+===============================================================
+PHASE 14 — CI/CD & Deployment
+===============================================================
+GOAL:
+  GitHub Actions CI pipeline with integration tests and Python
+  evaluation gate. Railway production deployment. Dockerfile finalized.
+
+ESTIMATED TIME: 1–2 days
+
+DEFINITION OF DONE:
+  - GitHub Actions CI runs on push to main: compile, test, evaluate.py
+  - CI fails if accuracy < 80%
+  - Application deployed to Railway (or documented deployment steps)
+  - /actuator/health returns UP in production
+
+FILES INVOLVED:
+  .github/workflows/ci.yml
+  .github/workflows/deploy.yml
+  docker-compose.prod.yml
+  src/main/resources/application-prod.yml
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] Push to main branch → GitHub Actions CI starts automatically
+  [ ] CI: compile step passes
+  [ ] CI: ./mvnw verify passes (all unit + integration tests)
+  [ ] CI: evaluate.py step runs and prints accuracy
+  [ ] CI: if accuracy < 80%, the build is marked FAILED
+  [ ] Non-main branch push → CI runs but deploy does not run
+  [ ] Deployed URL: GET /actuator/health returns {"status":"UP"}
+
+TESTING CHECKLIST:
+  [ ] No new tests — CI validation is the test
+
+COMMON PITFALLS:
+  - OPENAI_API_KEY not set in GitHub Actions secrets → tests that mock LLM still pass, but evaluate.py needs real key
+  - Analytics DB roles not created in CI services (must run init.sql as part of CI setup step)
+  - Railway not running Flyway automatically (it does — Spring Boot runs Flyway on startup)
+  - Docker build failing because mvnw not executable (chmod +x mvnw in Dockerfile)
+
+INTERVIEW CONCEPTS LEARNED:
+  - CI/CD for AI-powered applications
+  - Using evaluation accuracy as a build gate (same concept as test coverage thresholds)
+  - Multi-service Docker Compose for local dev vs prod environment differences
+  - Railway deployment for Java Spring Boot applications
+
+DEPENDENCIES: Phase 13
+
+===============================================================
+PHASE 15 — Documentation & README
+===============================================================
+GOAL:
+  Production-quality README, Swagger UI verification, LinkedIn showcase
+  preparation.
+
+ESTIMATED TIME: 2–3 days
+
+DEFINITION OF DONE:
+  - README covers: what the project does, why it matters, architecture diagram, tech stack, local setup (docker compose up), API usage examples, design decisions with rationale
+  - Swagger UI at /swagger-ui.html shows all endpoints with descriptions
+  - Demo video or live link available
+
+FILES INVOLVED:
+  README.md
+
+MANUAL VERIFICATION CHECKLIST:
+  [ ] README has a clear one-paragraph "What is QuerySense" section
+  [ ] README has a "Key Engineering Decisions" section explaining JSQLParser, dual-DB, semantic caching, correction loop
+  [ ] README has exact commands: git clone + docker compose up + curl commands to test
+  [ ] All endpoints have @Operation annotations visible in Swagger UI
+  [ ] README honest about AI-assisted development: "Built with AI coding assistance; all architectural decisions are original"
+
+TESTING CHECKLIST:
+  [ ] Ask someone unfamiliar with the project to follow the README and run it locally — if they succeed without your help, the README is complete
+
+COMMON PITFALLS:
+  - README claiming features not actually implemented (check every claim)
+  - Swagger docs missing for ADMIN-only endpoints (must include with note about required ADMIN role)
+  - Missing .env.example in repo causing local setup to fail
+
+INTERVIEW CONCEPTS LEARNED:
+  - Framing technical projects for an interview audience
+  - How to explain AI-assisted development honestly (you made architecture decisions, AI wrote code from spec)
+
+DEPENDENCIES: Phase 14
+
+===============================================================
+MASTER INTERVIEW TALKING POINTS
+(Prepare these answers before any interview)
+===============================================================
+
+Q: Why JSQLParser instead of regex for SQL validation?
+A: SQL is not a regular language. Regex cannot parse nested subqueries,
+   quoted identifiers containing SQL keywords, or comment syntax variants.
+   JSQLParser builds a full AST — statement type is a Java class, not a
+   string match — making it immune to case variations, whitespace injection,
+   and comment injection that defeat any regex approach.
+
+Q: Why two PostgreSQL databases instead of one?
+A: Defense in depth. Even if JSQLParser were bypassed (a bug, a library
+   vulnerability, a compromised application binary), the querysense_readonly
+   role's PostgreSQL-level privileges make any destructive SQL impossible.
+   The database cannot be compelled to execute a query the role lacks
+   privilege to run.
+
+Q: Why pgvector instead of Pinecone or Qdrant?
+A: The access group filter on the semantic cache lookup is a SQL JOIN
+   predicate: WHERE qj.group_id = $2. In a dedicated vector database,
+   this requires metadata filtering — less expressive and requiring
+   denormalized metadata. In pgvector, it's a single JOIN clause.
+   For relational-vector join requirements at this scale, pgvector is
+   architecturally superior. No second data store, no credentials,
+   no cross-system join complexity.
+
+Q: How do you know your system is working correctly?
+A: The regression evaluation pipeline. I maintain a golden dataset of
+   natural language question → expected SQL pairs. An evaluation endpoint
+   runs the full pipeline against every golden query and reports accuracy.
+   This runs in CI — if accuracy drops below 80%, the build fails. Same
+   concept as test coverage thresholds, applied to AI output quality.
+
+Q: What happens when the LLM generates wrong SQL?
+A: Three things happen in sequence. First, JSQLParser validates the AST
+   — syntax errors, non-SELECT statements, non-whitelisted table references
+   are all caught before execution. Second, if validation fails, a correction
+   prompt is built that includes the original question, the rejected SQL, the
+   specific failure reason, and the list of allowed tables — then Stage 4
+   is retried. Third, if execution fails (DB error, timeout), the DB error
+   message is fed back into another correction prompt and retried. Maximum
+   2 retries total.
+
+Q: Why Spring AI 1.0.x and not LangChain4j?
+A: LangChain4j is an abstraction over LLM orchestration patterns. For a
+   project whose interview value is demonstrating understanding of those
+   patterns, using a framework that hides them is counterproductive. Building
+   the pipeline stages explicitly in Spring Boot means every design decision
+   — structured output, few-shot retrieval, correction loops, cost tracking
+   — is visible and attributable to deliberate engineering choices.
+
+Q: How do you handle temporal expressions like "last quarter"?
+A: Deterministically, before the LLM call. A TemporalExtractor maps common
+   phrases to concrete date ranges using java.time at request time.
+   "Last quarter" resolved at 2:00 AM on December 31 is different from
+   at 11:59 PM on the same day if you let the LLM handle it. Resolved
+   dates are injected into the prompt as explicit context: "Note: 'last
+   quarter' refers to 2025-10-01 through 2025-12-31." This eliminates
+   an entire class of LLM date-handling errors.
+
+Q: What is your cache invalidation strategy?
+A: Two levels. Exact hash cache (SHA-256 of normalized question text) in
+   Redis with 1-hour TTL. Semantic cache (pgvector cosine similarity) also
+   with 1-hour TTL. TTL is chosen to balance cost savings against data
+   staleness — analytics data changes as business operations proceed.
+   When schema sync runs (a column renamed, a table added), Redis schema:version
+   is incremented and included in cache keys, invalidating stale entries
+   without a full FLUSHDB.
