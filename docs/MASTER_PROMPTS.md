@@ -23,7 +23,9 @@ This project is governed by a single architectural source of truth. You must fol
 TECHNOLOGY STACK (authoritative — do not deviate):
 - Language: Java 21 (use records, sealed interfaces, pattern matching where appropriate)
 - Framework: Spring Boot 3.3.x
-- AI Framework: Spring AI 1.0.0 (use ChatClient.Builder — NOT direct ChatClient injection)
+- AI Framework: Spring AI 1.0.0 (used for Ollama embeddings only — inject EmbeddingModel, NOT ChatClient or ChatClient.Builder)
+- LLM Client: Groq API via Spring WebClient (OpenAI-compatible REST) — NOT OpenAI SDK, NOT spring-ai-openai-starter
+- Embedding: Ollama local (BAAI/bge-small-en-v1.5, 384 dims) — runs in Docker, zero recurring API cost
 - Build: Maven 3.9.x with Maven Wrapper (mvnw)
 - AST Validation: JSQLParser 4.9
 - Application DB: PostgreSQL 16 with pgvector extension (pgvector/pgvector:pg16 image)
@@ -48,12 +50,12 @@ ASYNC ARCHITECTURE (critical):
 - PipelineContext fields are plain (non-volatile, non-synchronized) — safe because accessed by one thread only
 - ThreadPoolTaskExecutor: core=4, max=10, queue=50
 
-SPRING AI 1.0.x API (critical — version-specific):
-- Inject ChatClient.Builder, not ChatClient
-- Build ChatClient instances from builder with .defaultOptions(...)
-- Structured output: .call().entity(MyRecord.class)
-- Streaming: .stream().content() returns Flux<String>
-- Inject EmbeddingModel (not EmbeddingClient)
+AI PROVIDER API (critical):
+- Groq chat: inject WebClient (built from GroqConfig bean), call POST /chat/completions with OpenAI-compatible JSON body
+- SQL generation: blocking WebClient call, parse JSON response manually, deserialize to SQLGenerationResult record
+- Streaming explanation: WebClient bodyToFlux(String.class) with stream:true, parse SSE lines manually
+- Embeddings: Spring AI OllamaEmbeddingModel — inject EmbeddingModel (not EmbeddingClient), call embedForResponse(List.of(text))
+- Vector dimensions: BGE-small = 384 — all vector columns must be vector(384), NOT vector(1536)
 
 SSE LIFECYCLE:
 - SseEmitter timeout: 120_000ms
@@ -94,7 +96,7 @@ Before writing any code, confirm you understand these rules by answering YES or 
 3. Will you use @Autowired field injection anywhere? (Expected: NO)
 4. Will you use Lombok? (Expected: NO)
 5. Will you configure Flyway to run against analyticsDataSource or introspectDataSource? (Expected: NO)
-6. Will you inject ChatClient directly without using ChatClient.Builder? (Expected: NO)
+6. Will you use spring-ai-openai-starter or OpenAI ChatClient instead of Groq WebClient + Ollama EmbeddingModel? (Expected: NO)
 7. Will you share a PipelineContext instance between two pipeline executions? (Expected: NO)
 8. Will you use JdbcTemplate in SafeQueryExecutor without the @Qualifier("analyticsJdbcTemplate") annotation? (Expected: NO)
 
@@ -133,7 +135,8 @@ GENERATE EXACTLY THESE FILES (no others):
 - .env.example
 
 IMPLEMENTATION RULES:
-- pom.xml must include: spring-boot-starter-web, spring-boot-starter-security, spring-boot-starter-data-jpa, spring-boot-starter-data-redis, spring-boot-starter-validation, spring-boot-starter-actuator, spring-ai-bom (1.0.0), spring-ai-openai-spring-boot-starter, spring-ai-pgvector-store-spring-boot-starter, jsqlparser (4.9), flyway-core, postgresql, resilience4j-spring-boot3, testcontainers, spring-boot-testcontainers, java-version: 21
+- pom.xml must include: spring-boot-starter-web, spring-boot-starter-security, spring-boot-starter-data-jpa, spring-boot-starter-data-redis, spring-boot-starter-validation, spring-boot-starter-actuator, spring-boot-starter-webflux (for Groq WebClient), spring-ai-bom (1.0.0), spring-ai-ollama-spring-boot-starter (for local embeddings), spring-ai-pgvector-store-spring-boot-starter, jsqlparser (4.9), flyway-core, postgresql, resilience4j-spring-boot3, testcontainers, spring-boot-testcontainers, java-version: 21
+- DO NOT add spring-ai-openai-spring-boot-starter — Groq is called via WebClient
 - DataSourceConfig.java must define exactly three beans: appDataSource (@Primary @ConfigurationProperties("spring.datasource.app")), analyticsDataSource (@ConfigurationProperties("spring.datasource.analytics")), introspectDataSource (@ConfigurationProperties("spring.datasource.introspect")), plus analyticsJdbcTemplate and introspectJdbcTemplate
 - AsyncConfig.java must implement AsyncConfigurer, define pipelineExecutor bean: core=4, max=10, queue=50, CallerRunsPolicy, waitForTasksToCompleteOnShutdown=true, awaitTermination=30s
 - application.yml must define spring.datasource.app, spring.datasource.analytics, spring.datasource.introspect connection pool sections — NO flyway.url or flyway.username
@@ -309,7 +312,7 @@ IMPLEMENTATION RULES:
 - Generate each migration file exactly as defined in the architecture database design section
 - V15__create_pgvector_extension.sql must contain ONLY: CREATE EXTENSION IF NOT EXISTS vector;
 - This extension is enabled on the application DB (querysense), which uses the pgvector/pgvector:pg16 Docker image — it is already available, just needs to be created
-- V16–V18 define table_embeddings, column_embeddings, question_embeddings — use vector(1536) type
+- V16–V18 define table_embeddings, column_embeddings, question_embeddings — use vector(384) type (BGE-small-en-v1.5 = 384 dims)
 - V16–V18 must also include the HNSW index CREATE INDEX statements (WITH m=16, ef_construction=64, vector_cosine_ops)
 - V19 contains all relational indexes from the architecture — copy exactly
 - Migrations must be idempotent where possible (use IF NOT EXISTS)
@@ -319,7 +322,7 @@ VALIDATION REQUIREMENTS:
 - ./mvnw compile -q passes
 - docker compose down -v && docker compose up — Flyway must run V1–V19 successfully
 - SELECT count(*) FROM information_schema.tables WHERE table_schema='public' in querysense DB returns 19 tables
-- \d table_embeddings in psql shows embedding column as vector(1536)
+- \d table_embeddings in psql shows embedding column as vector(384)
 - SELECT * FROM pg_indexes WHERE tablename='table_embeddings' shows the HNSW index
 
 STOPPING POINT: Migrations only. Do not begin AI client or pipeline work.
@@ -340,20 +343,22 @@ GENERATE EXACTLY THESE FILES:
 - src/main/java/com/querysense/ai/client/EmbeddingClientWrapper.java
 - src/main/java/com/querysense/ai/model/SQLGenerationResult.java
 - src/main/java/com/querysense/ai/model/ExplanationResult.java
-- src/main/java/com/querysense/config/SpringAIConfig.java
+- src/main/java/com/querysense/config/GroqConfig.java   (WebClient bean configured with Groq base URL + API key)
 - src/main/java/com/querysense/schema/embedding/SchemaEmbeddingService.java
 - src/main/java/com/querysense/schema/embedding/DdlReconstructionService.java
 - src/main/resources/prompts/sql-generation-system-prompt.st
 - src/main/resources/prompts/result-explanation-system-prompt.st
 
 IMPLEMENTATION RULES FOR LLMClient:
-- Constructor receives ChatClient.Builder (injected by Spring) — do NOT @Autowired a ChatClient bean
-- Build two ChatClient instances from the builder:
-  * chatClient (GPT-4o, temperature=0.0) for SQL generation
-  * miniChatClient (gpt-4o-mini, temperature=0.3) for explanation
-- generateSql(String systemPrompt, String userPrompt) → return .call().entity(SQLGenerationResult.class)
-- streamExplanation(String systemPrompt, String userPrompt) → return .stream().content() as Flux<String>
-- Both methods log token usage to LlmCallLog after the call (inject LlmCallLogRepository, save asynchronously to not block the pipeline — use @Async or save in CachingAndAuditStage instead — choose the simpler approach)
+- Inject WebClient (built in GroqConfig from ${app.ai.groq.api-key} and ${app.ai.groq.base-url}) — NOT ChatClient, NOT OpenAI SDK
+- Inject @Value("${app.ai.model.sql}") sqlModel and @Value("${app.ai.model.explanation}") explanationModel
+- generateSql(String systemPrompt, String userPrompt):
+  * POST to /chat/completions with body: { model, temperature: 0.0, max_tokens: 1000, messages: [{system}, {user}] }
+  * Use WebClient.post().bodyValue(requestBody).retrieve().bodyToMono(String.class).block()
+  * Parse OpenAI-compatible JSON response: choices[0].message.content → strip ```json fences → ObjectMapper.readValue → SQLGenerationResult
+- streamExplanation(String systemPrompt, String userPrompt):
+  * POST with stream: true → WebClient bodyToFlux(String.class)
+  * Filter lines starting with "data: ", strip prefix, parse delta.content, return Flux<String>
 - LlmCallLog saving happens in CachingAndAuditStage (simpler) — LLMClient returns token metadata via a wrapper record
 
 IMPLEMENTATION RULES FOR SQLGenerationResult:
@@ -362,9 +367,11 @@ IMPLEMENTATION RULES FOR SQLGenerationResult:
 - Use @JsonProperty if needed for camelCase matching
 
 IMPLEMENTATION RULES FOR EmbeddingClientWrapper:
-- Inject EmbeddingModel (Spring AI 1.0.x type)
+- Inject EmbeddingModel (Spring AI OllamaEmbeddingModel — auto-configured from spring-ai-ollama-spring-boot-starter)
+- The model is bge-small-en-v1.5 (384 dims) running locally in Ollama Docker container
 - embed(String text): returns float[] from embeddingModel.embedForResponse(List.of(text)).getResults().get(0).getOutput()
 - embedToList(String text): returns List<Double> (for pgvector JDBC insert compatibility)
+- IMPORTANT: all vector columns are vector(384) — do NOT pass 1536-element arrays
 
 IMPLEMENTATION RULES FOR SchemaEmbeddingService:
 - embedAllTables(): for each whitelisted registered_table, build embed_content string as "table_name: {name}\ndescription: {desc}\ncolumns: {col1 (type), col2 (type)...}", call EmbeddingClientWrapper.embed(), upsert into table_embeddings
@@ -384,10 +391,11 @@ IMPLEMENTATION RULES FOR PROMPT TEMPLATES:
 - result-explanation-system-prompt.st variables: originalQuestion, rowCount, resultSample
 
 VALIDATION REQUIREMENTS:
-- LLMClient can be instantiated in a unit test with a mocked ChatClient.Builder
+- LLMClient can be instantiated in a unit test with a mocked WebClient and WebClient.Builder (no ChatClient involved)
 - SchemaEmbeddingService can be tested with mocked EmbeddingClientWrapper — verify embed_content is non-empty for each table
 - DdlReconstructionService unit test: given 2 tables and 5 columns each, reconstructed DDL contains all table names and column names
-- Spring AI config does not fail on startup even if OPENAI_API_KEY is a dummy value in local test profile
+- GroqConfig WebClient bean initializes without error even if GROQ_API_KEY is a dummy value in local test profile (no eager API call at startup)
+- Ollama EmbeddingModel fails gracefully if Ollama is not running — application starts but embedding calls return error (acceptable for unit tests)
 
 STOPPING POINT: AI clients and embedding only. Do not begin pipeline stages.
 ```
@@ -799,7 +807,8 @@ IMPLEMENTATION RULES FOR CI:
 - ci.yml triggers on push to main and develop, and on PRs to main
 - Jobs: postgres-app (pgvector/pgvector:pg16), postgres-analytics (postgres:16-alpine), redis (redis:7-alpine) as service containers
 - Steps: checkout, setup-java (21, temurin, maven cache), setup analytics DB roles and schema (psql commands), run ./mvnw verify, upload surefire-reports as artifact
-- Use github.com secrets for OPENAI_API_KEY_TEST
+- Use github.com secrets for GROQ_API_KEY (Groq free tier — no cost in CI)
+- Add ollama as a service container: image ollama/ollama:latest, pull bge-small-en-v1.5 as a setup step
 - After ./mvnw verify: run python evaluate.py --fail-below 0.80 (fails build if accuracy < 80%)
 - deploy.yml: runs only after ci.yml passes on main branch, deploys to Railway
 
@@ -824,7 +833,7 @@ When reviewing AI-generated code, immediately reject and redirect if you see:
 
 | Pattern | Problem | Correct Approach |
 |---|---|---|
-| `@Autowired private ChatClient chatClient` | Wrong Spring AI 1.0.x API | Inject `ChatClient.Builder`, build manually |
+| `@Autowired private ChatClient chatClient` (or `ChatClient.Builder`) | Wrong API — OpenAI pattern, not Groq | Inject `WebClient` bean from `GroqConfig`; for embeddings inject `EmbeddingModel` |
 | `@Autowired private JdbcTemplate jdbcTemplate` in SafeQueryExecutor | Uses wrong DataSource | `@Qualifier("analyticsJdbcTemplate")` |
 | `spring.flyway.url=...` in application.yml | Flyway runs against wrong DB | Remove — Flyway auto-binds to @Primary |
 | `@Data` on any entity | Lombok not in stack | Explicit getters/setters/constructors |
@@ -833,4 +842,7 @@ When reviewing AI-generated code, immediately reject and redirect if you see:
 | `context.getEmitter().send(...)` in a stage | Breaks SSE lifecycle contract | Always go through SseEmitterRegistry |
 | `PipelineContext` stored in a static field | Thread-safety violation | One instance per async task, never stored statically |
 | Raw string concatenation for LIMIT injection | SQL injection risk | Use JSQLParser API to modify AST |
+| `spring-ai-openai-spring-boot-starter` in pom.xml | Paid OpenAI dependency | Use `spring-ai-ollama-spring-boot-starter` + WebClient for Groq |
+| `vector(1536)` in migrations | Wrong dimension for BGE | BGE-small-en-v1.5 = 384 dims — use `vector(384)` |
+| OPENAI_API_KEY in env | OpenAI cost | Use `GROQ_API_KEY` + `OLLAMA_BASE_URL` |
 | Missing `@Transactional` on AuditService write methods | Non-atomic audit writes | Add @Transactional |

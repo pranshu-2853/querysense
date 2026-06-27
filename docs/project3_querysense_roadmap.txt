@@ -76,6 +76,7 @@ COMMON PITFALLS:
   - pgvector image used for analytics DB (wrong — analytics uses plain postgres:16-alpine)
   - Analytics init.sql tries to create vector extension (wrong — only app DB needs it)
   - Three DataSource beans but only two JdbcTemplate beans (missing introspectJdbcTemplate)
+  - Using spring-ai-openai-starter instead of spring-ai-ollama-starter + WebClient for Groq
 
 INTERVIEW CONCEPTS LEARNED:
   - Multi-DataSource Spring Boot configuration
@@ -268,7 +269,7 @@ ESTIMATED TIME: 1–2 days
 DEFINITION OF DONE:
   - docker compose down -v && docker compose up runs V1–V19 successfully
   - 19 tables exist in querysense DB
-  - table_embeddings has a vector(1536) column
+  - table_embeddings has a vector(384) column (BGE-small-en-v1.5 = 384 dims)
   - HNSW index exists on all three embedding tables
   - pgvector extension is active: SELECT * FROM pg_extension WHERE extname = 'vector' returns a row
 
@@ -289,8 +290,8 @@ FILES INVOLVED:
 MANUAL VERIFICATION CHECKLIST:
   [ ] docker compose down -v && docker compose up — Flyway shows 19 migrations applied
   [ ] SELECT count(*) FROM information_schema.tables WHERE table_schema='public' = 19
-  [ ] \d table_embeddings shows embedding column as vector(1536)
-  [ ] \d column_embeddings shows embedding column as vector(1536)
+  [ ] \d table_embeddings shows embedding column as vector(384)
+  [ ] \d column_embeddings shows embedding column as vector(384)
   [ ] SELECT indexname FROM pg_indexes WHERE tablename='table_embeddings' shows HNSW index
   [ ] SELECT * FROM pg_extension WHERE extname='vector' returns a row
   [ ] All foreign key constraints exist (SELECT * FROM information_schema.referential_constraints)
@@ -302,13 +303,15 @@ TESTING CHECKLIST:
 COMMON PITFALLS:
   - V15 trying to CREATE EXTENSION vector on postgres-analytics DB (wrong — only app DB has pgvector image)
   - HNSW index CREATE failing because vector extension not yet enabled (V15 must come before V16–V18)
-  - vector(1536) column type not recognized if pgvector extension not installed in Docker image
+  - vector(1536) column type: BGE-small-en-v1.5 produces 384-dim vectors — all migrations must use vector(384)
+  - vector(384) column type not recognized if pgvector extension not installed in Docker image
 
 INTERVIEW CONCEPTS LEARNED:
   - pgvector HNSW vs IVFFlat index tradeoffs
   - Why HNSW is better for small-to-medium datasets (online indexing, no training phase)
   - Flyway migration ordering and naming conventions
   - PostgreSQL extensions system
+  - Embedding dimension is model-dependent: BGE-small=384, bge-base=768, nomic-embed=768 — keep it in config not hardcoded
 
 DEPENDENCIES: Phase 04
 
@@ -327,14 +330,14 @@ DEFINITION OF DONE:
   - Schema sync generates embeddings for all whitelisted tables and columns
   - table_embeddings has rows after sync
   - DdlReconstructionService produces readable DDL string from mock schema context
-  - LLMClient unit tests pass with mocked ChatClient.Builder
+  - LLMClient unit tests pass with mocked WebClient/WebClient.Builder
 
 FILES INVOLVED:
   src/main/java/com/querysense/ai/client/LLMClient.java
   src/main/java/com/querysense/ai/client/EmbeddingClientWrapper.java
   src/main/java/com/querysense/ai/model/SQLGenerationResult.java
   src/main/java/com/querysense/ai/model/ExplanationResult.java
-  src/main/java/com/querysense/config/SpringAIConfig.java
+  src/main/java/com/querysense/config/GroqConfig.java       (WebClient bean for Groq — base URL + API key)
   src/main/java/com/querysense/schema/embedding/SchemaEmbeddingService.java
   src/main/java/com/querysense/schema/embedding/DdlReconstructionService.java
   src/main/resources/prompts/sql-generation-system-prompt.st
@@ -344,28 +347,32 @@ FILES INVOLVED:
   src/test/java/com/querysense/schema/DdlReconstructionServiceTest.java
 
 MANUAL VERIFICATION CHECKLIST:
-  [ ] POST /api/v1/schema/sync (with real OPENAI_API_KEY in .env) → runs without error
+  [ ] Ollama is running and bge-small-en-v1.5 is pulled: curl http://localhost:11434/api/tags shows the model
+  [ ] POST /api/v1/schema/sync (with real GROQ_API_KEY in .env) → runs without error
   [ ] SELECT count(*) FROM table_embeddings > 0 after sync
   [ ] SELECT count(*) FROM column_embeddings > 0 after sync
   [ ] SELECT length(embed_content::text) FROM table_embeddings LIMIT 1 > 50 (content is meaningful)
-  [ ] LLMClient does not inject ChatClient directly (grep for "@Autowired" near ChatClient — must be zero)
+  [ ] LLMClient does not inject ChatClient (grep for "ChatClient" in LLMClient.java — must be zero occurrences)
 
 TESTING CHECKLIST:
-  [ ] LLMClientTest: mock ChatClient.Builder, verify generateSql() calls .entity(SQLGenerationResult.class)
+  [ ] LLMClientTest: mock WebClient/WebClient.Builder, verify generateSql() sends correct JSON body and parses Groq response into SQLGenerationResult
   [ ] LLMClientTest: verify streamExplanation() calls .stream().content()
   [ ] SchemaEmbeddingServiceTest: mock EmbeddingClientWrapper, verify embed_content built correctly for a table with 3 columns
   [ ] DdlReconstructionServiceTest: given RetrievedSchemaContext with 2 tables, verify DDL contains both table names and all column names
 
 COMMON PITFALLS:
-  - Using ChatClient as an injectable @Bean instead of ChatClient.Builder
-  - Spring AI 1.0.x API: .call().entity() vs old .call().content() — must use .entity() for structured output
-  - OpenAI embedding dimensions: text-embedding-3-small is 1536 — mismatch with vector(1536) column causes insert failure
-  - pgvector JDBC insert: float[] from embedding model must be cast correctly for PostgreSQL — use ::vector cast in the SQL
+  - Forgetting to pull BGE model: docker exec <ollama> ollama pull bge-small-en-v1.5 (must be done once before first embedding call)
+  - Using vector(1536) in migrations — BGE-small-en-v1.5 is 384 dims, not 1536
+  - Groq JSON parsing: model wraps SQL in ```json fences — strip before ObjectMapper.readValue
+  - WebClient streaming: filter "data: [DONE]" sentinel lines before JSON parsing
+  - pgvector JDBC insert: float[] from embedding model must be cast correctly — use ::vector cast in SQL
+  - Adding spring-ai-openai-starter to pom.xml (unnecessary and introduces OpenAI dependency)
 
 INTERVIEW CONCEPTS LEARNED:
-  - Spring AI 1.0.x ChatClient.Builder pattern vs direct injection
-  - Structured LLM output with Java records
-  - Embedding models and vector dimensions
+  - Groq as the default provider — environment-variable-driven model selection means zero-code provider switch
+  - Local embedding models (Ollama + BGE) vs cloud embeddings: cost vs convenience tradeoff
+  - Structured LLM output with manual JSON parsing (resilient to model formatting variation)
+  - BGE-small-en-v1.5: 384-dim, high quality, runs on CPU — ideal for schema embeddings; dimension is model-dependent, kept in config
   - pgvector JDBC insertion pattern
 
 DEPENDENCIES: Phase 05
@@ -824,7 +831,8 @@ TESTING CHECKLIST:
   [ ] No new tests — CI validation is the test
 
 COMMON PITFALLS:
-  - OPENAI_API_KEY not set in GitHub Actions secrets → tests that mock LLM still pass, but evaluate.py needs real key
+  - GROQ_API_KEY not set in GitHub Actions secrets → tests that mock LLM still pass, but evaluate.py needs real key
+  - Ollama service not set up in CI → embedding calls fail; add ollama service container and pull step in ci.yml
   - Analytics DB roles not created in CI services (must run init.sql as part of CI setup step)
   - Railway not running Flyway automatically (it does — Spring Boot runs Flyway on startup)
   - Docker build failing because mvnw not executable (chmod +x mvnw in Dockerfile)
@@ -868,6 +876,7 @@ COMMON PITFALLS:
   - README claiming features not actually implemented (check every claim)
   - Swagger docs missing for ADMIN-only endpoints (must include with note about required ADMIN role)
   - Missing .env.example in repo causing local setup to fail
+  - Forgetting GROQ_API_KEY or OLLAMA_BASE_URL in .env.example
 
 INTERVIEW CONCEPTS LEARNED:
   - Framing technical projects for an interview audience
@@ -919,6 +928,22 @@ A: Three things happen in sequence. First, JSQLParser validates the AST
    is retried. Third, if execution fails (DB error, timeout), the DB error
    message is fed back into another correction prompt and retried. Maximum
    2 retries total.
+
+Q: Why Groq instead of OpenAI? And why WebClient instead of the OpenAI SDK?
+A: Groq exposes an OpenAI-compatible REST API, so the prompt engineering is
+   identical. Calling it via Spring WebClient means zero vendor lock-in — swapping
+   to any other provider is a single config change. Groq's free tier covers
+   development and CI entirely. For a resume project, demonstrating cost-conscious
+   architecture is itself a talking point: "zero recurring cost" is a concrete
+   engineering decision, not an accident.
+
+Q: Why Ollama for embeddings instead of OpenAI text-embedding-3-small?
+A: Schema embeddings happen only during schema sync — an infrequent, offline
+   operation. Running BAAI/bge-small-en-v1.5 locally via Ollama eliminates the
+   entire embedding API cost. BGE-small produces 384-dimensional vectors with
+   quality comparable to OpenAI's small embedding model for English text retrieval.
+   The only change is the vector column dimensions (384 vs 1536) and the Docker
+   service — all pipeline logic stays identical.
 
 Q: Why Spring AI 1.0.x and not LangChain4j?
 A: LangChain4j is an abstraction over LLM orchestration patterns. For a

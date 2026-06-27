@@ -97,10 +97,10 @@ Text-to-SQL is one of the most commercially valuable AI engineering problems of 
 │  │  [1] QueryPreProcessingStage                                   │ │
 │  │  [2] SemanticCacheStage    ──► Redis (exact) + pgvector (sem.) │ │
 │  │  [3] SchemaRetrievalStage  ──► pgvector (DDL pruning)          │ │
-│  │  [4] SqlGenerationStage    ──► OpenAI GPT-4o via Spring AI     │ │
+│  │  [4] SqlGenerationStage    ──► Groq LLM via WebClient (OpenAI-compatible)     │ │
 │  │  [5] ASTValidationStage    ──► JSQLParser (deterministic)      │ │
 │  │  [6] QueryExecutionStage   ──► PostgreSQL (read-only role)     │ │
-│  │  [7] ResultExplanationStage ─► GPT-4o-mini (SSE streaming)     │ │
+│  │  [7] ResultExplanationStage ─► Groq LLM mini model (SSE streaming)     │ │
 │  │  [8] CachingAndAuditStage  ──► Redis + PostgreSQL              │ │
 │  │                                                                │ │
 │  └─────────────────────────────────────────────────────────────── ┘ │
@@ -113,9 +113,9 @@ Text-to-SQL is one of the most commercially valuable AI engineering problems of 
 └─────────────────────────────────────────────────────────────────────┘
          │                               │
 ┌────────▼────────┐             ┌────────▼────────────┐
-│   OpenAI API    │             │  Analytics Database  │
-│  (GPT-4o +      │             │  PostgreSQL          │
-│   Embeddings)   │             │  (read-only role)    │
+│    Groq API     │             │  Analytics Database  │
+│  (llama/qwen +   │             │  PostgreSQL          │
+│   Ollama embed) │             │  (read-only role)    │
 └─────────────────┘             └─────────────────────┘
 ```
 
@@ -358,7 +358,14 @@ public class SseEmitterRegistry {
 
 ---
 
-## 11. Spring AI 1.0.x Integration (Critical — Version-Specific API)
+## 11. AI Provider Integration (Groq + Ollama — Zero recurring API cost)
+
+> **Default Provider:** Groq (chat/SQL/explanation) + Ollama local (embeddings)
+> **Cost:** $0 recurring API cost — Groq free tier + Ollama runs locally in Docker
+> **Groq API:** OpenAI-compatible REST at `https://api.groq.com/openai/v1` — no OpenAI SDK needed
+> **Embedding model:** `bge-small-en-v1.5` via Ollama — 384 dimensions, runs locally, no API cost
+> **Embedding dimension:** Controlled by `EMBEDDING_MODEL` env var. Default `bge-small-en-v1.5` = **384 dims**. If you switch to `bge-base-en-v1.5` (768) or `nomic-embed-text` (768), update `EMBEDDING_DIMENSION` and re-run migrations. Do not hardcode 384 in application logic — read from config.
+> **Model fallback:** All model names are environment variables (`MODEL_SQL`, `MODEL_EXPLANATION`). Switching providers or models requires only a config change, no code change.
 
 **Dependency (pom.xml):**
 ```xml
@@ -375,9 +382,15 @@ public class SseEmitterRegistry {
 </dependencyManagement>
 
 <dependencies>
+    <!-- Groq uses OpenAI-compatible REST API — call via Spring WebClient, no OpenAI starter needed -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-webflux</artifactId>
+    </dependency>
+    <!-- Ollama for local embeddings (BAAI/bge-small-en-v1.5) -->
     <dependency>
         <groupId>org.springframework.ai</groupId>
-        <artifactId>spring-ai-openai-spring-boot-starter</artifactId>
+        <artifactId>spring-ai-ollama-spring-boot-starter</artifactId>
     </dependency>
     <!-- pgvector support -->
     <dependency>
@@ -391,69 +404,123 @@ public class SseEmitterRegistry {
 ```yaml
 spring:
   ai:
-    openai:
-      api-key: ${OPENAI_API_KEY}
-      chat:
-        options:
-          model: gpt-4o
-          temperature: 0.0       # Deterministic SQL generation
-          max-tokens: 1000
+    ollama:
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
       embedding:
         options:
-          model: text-embedding-3-small
+          model: ${EMBEDDING_MODEL:bge-small-en-v1.5}
+
+app:
+  ai:
+    provider: groq
+    groq:
+      api-key: ${GROQ_API_KEY}
+      base-url: https://api.groq.com/openai/v1
+    model:
+      sql: ${MODEL_SQL:llama-3.3-70b-versatile}
+      explanation: ${MODEL_EXPLANATION:llama-3.3-70b-versatile}
+      temperature-sql: 0.0
+      temperature-explanation: 0.3
+      max-tokens: 1000
 ```
 
-**LLMClient wrapper — correct Spring AI 1.0.x API:**
+**LLMClient wrapper — Groq via WebClient (OpenAI-compatible REST API):**
 ```java
 @Component
 public class LLMClient {
 
-    private final ChatClient chatClient;
-    private final ChatClient miniChatClient;
+    private final WebClient groqWebClient;
+    private final ObjectMapper objectMapper;
+    private final String sqlModel;
+    private final String explanationModel;
 
-    // Spring AI 1.0.x: inject ChatClient.Builder, NOT ChatClient directly
-    public LLMClient(ChatClient.Builder builder,
-                     @Value("${spring.ai.openai.chat.options.model}") String model) {
-        this.chatClient = builder
-            .defaultOptions(OpenAiChatOptions.builder()
-                .withModel("gpt-4o")
-                .withTemperature(0.0f)
-                .build())
+    // Groq exposes an OpenAI-compatible API at https://api.groq.com/openai/v1
+    // We call it via Spring WebClient — no OpenAI starter needed
+    public LLMClient(WebClient.Builder webClientBuilder,
+                     ObjectMapper objectMapper,
+                     @Value("${app.ai.groq.api-key}") String groqApiKey,
+                     @Value("${app.ai.groq.base-url}") String groqBaseUrl,
+                     @Value("${app.ai.model.sql}") String sqlModel,
+                     @Value("${app.ai.model.explanation}") String explanationModel) {
+        this.groqWebClient = webClientBuilder
+            .baseUrl(groqBaseUrl)
+            .defaultHeader("Authorization", "Bearer " + groqApiKey)
+            .defaultHeader("Content-Type", "application/json")
             .build();
-
-        this.miniChatClient = builder
-            .defaultOptions(OpenAiChatOptions.builder()
-                .withModel("gpt-4o-mini")
-                .withTemperature(0.3f)
-                .build())
-            .build();
+        this.objectMapper = objectMapper;
+        this.sqlModel = sqlModel;
+        this.explanationModel = explanationModel;
     }
 
-    // Structured output for SQL generation — Spring AI 1.0.x pattern
+    // SQL generation: blocking call, returns parsed SQLGenerationResult
     public SQLGenerationResult generateSql(String systemPrompt, String userPrompt) {
-        return chatClient.prompt()
-            .system(systemPrompt)
-            .user(userPrompt)
-            .call()
-            .entity(SQLGenerationResult.class);   // Spring AI structured output
+        var requestBody = Map.of(
+            "model", sqlModel,
+            "temperature", 0.0,
+            "max_tokens", 1000,
+            "messages", List.of(
+                Map.of("role", "system", "content", systemPrompt),
+                Map.of("role", "user", "content", userPrompt)
+            )
+        );
+
+        String rawJson = groqWebClient.post()
+            .uri("/chat/completions")
+            .bodyValue(requestBody)
+            .retrieve()
+            .bodyToMono(String.class)
+            .block();
+
+        // Parse OpenAI-compatible response, extract content, then deserialize to record
+        try {
+            JsonNode root = objectMapper.readTree(rawJson);
+            String content = root.path("choices").get(0).path("message").path("content").asText();
+            String cleaned = content.replaceAll("```json|```", "").trim();
+            return objectMapper.readValue(cleaned, SQLGenerationResult.class);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse SQL generation response", e);
+        }
     }
 
-    // Streaming for result explanation — Spring AI 1.0.x pattern
+    // Streaming for result explanation — uses Groq SSE (stream: true)
     public Flux<String> streamExplanation(String systemPrompt, String userPrompt) {
-        return miniChatClient.prompt()
-            .system(systemPrompt)
-            .user(userPrompt)
-            .stream()
-            .content();
+        var requestBody = Map.of(
+            "model", explanationModel,
+            "temperature", 0.3,
+            "max_tokens", 1000,
+            "stream", true,
+            "messages", List.of(
+                Map.of("role", "system", "content", systemPrompt),
+                Map.of("role", "user", "content", userPrompt)
+            )
+        );
+
+        return groqWebClient.post()
+            .uri("/chat/completions")
+            .bodyValue(requestBody)
+            .retrieve()
+            .bodyToFlux(String.class)
+            .filter(line -> line.startsWith("data: ") && !line.contains("[DONE]"))
+            .map(line -> line.substring(6))
+            .mapNotNull(json -> {
+                try {
+                    JsonNode node = objectMapper.readTree(json);
+                    return node.path("choices").get(0).path("delta").path("content").asText(null);
+                } catch (Exception e) { return null; }
+            })
+            .filter(token -> token != null && !token.isEmpty());
     }
 }
 ```
 
-**EmbeddingClient wrapper:**
+**EmbeddingClient wrapper — Ollama local embeddings (BAAI/bge-small-en-v1.5):**
 ```java
 @Component
 public class EmbeddingClientWrapper {
 
+    // Spring AI OllamaEmbeddingModel — connects to local Ollama instance
+    // Model: bge-small-en-v1.5 produces 384-dimension vectors (FREE, local, fast)
+    // Pull once: ollama pull bge-small-en-v1.5
     private final EmbeddingModel embeddingModel;
 
     public EmbeddingClientWrapper(EmbeddingModel embeddingModel) {
@@ -464,8 +531,19 @@ public class EmbeddingClientWrapper {
         EmbeddingResponse response = embeddingModel.embedForResponse(List.of(text));
         return response.getResults().get(0).getOutput();
     }
+
+    public List<Double> embedToList(String text) {
+        float[] arr = embed(text);
+        List<Double> list = new ArrayList<>(arr.length);
+        for (float v : arr) list.add((double) v);
+        return list;
+    }
 }
 ```
+
+> **Note on vector dimensions:** BGE-small-en-v1.5 produces **384-dimension** vectors, not 1536.
+> The Flyway migration `V16–V18` must use `vector(384)` instead of `vector(1536)`.
+> See the updated migration note in Section 12.
 
 ---
 
@@ -659,7 +737,7 @@ CREATE TABLE table_embeddings (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     table_id      UUID NOT NULL REFERENCES registered_tables(id) ON DELETE CASCADE,
     embed_content TEXT NOT NULL,
-    embedding     vector(1536) NOT NULL,
+    embedding     vector(384) NOT NULL,   -- BGE-small-en-v1.5 = 384 dims
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(table_id)
 );
@@ -674,7 +752,7 @@ CREATE TABLE column_embeddings (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     column_id     UUID NOT NULL REFERENCES registered_columns(id) ON DELETE CASCADE,
     embed_content TEXT NOT NULL,
-    embedding     vector(1536) NOT NULL,
+    embedding     vector(384) NOT NULL,   -- BGE-small-en-v1.5 = 384 dims
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(column_id)
 );
@@ -688,7 +766,7 @@ CREATE INDEX idx_column_embeddings_hnsw
 CREATE TABLE question_embeddings (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_id        UUID NOT NULL REFERENCES query_jobs(id) ON DELETE CASCADE,
-    embedding     vector(1536) NOT NULL,
+    embedding     vector(384) NOT NULL,   -- BGE-small-en-v1.5 = 384 dims
     cached_sql    TEXT,
     cached_result JSONB,
     cache_valid   BOOLEAN NOT NULL DEFAULT true,
@@ -1111,9 +1189,9 @@ GET    /actuator/metrics
 | Cache / Rate Limit | Redis | 7 |
 | Migrations | Flyway | Auto-configured via Spring Boot |
 | Analytics DB | PostgreSQL | 16 (postgres:16-alpine image) |
-| SQL Generation | OpenAI GPT-4o | via Spring AI |
-| Explanation | OpenAI GPT-4o-mini | via Spring AI |
-| Embeddings | text-embedding-3-small | via Spring AI |
+| SQL Generation | Groq (llama-3.3-70b-versatile) | via WebClient |
+| Explanation | Groq (llama-3.3-70b-versatile) | via WebClient |
+| Embeddings | BAAI/bge-small-en-v1.5 | via Ollama (local) |
 | Resilience | Resilience4j | via Spring Boot starter |
 | Testing | JUnit 5 + Mockito + Testcontainers | — |
 | Containerization | Docker + Docker Compose | — |
@@ -1139,7 +1217,7 @@ querysense/
 │       │       │   ├── SecurityConfig.java
 │       │       │   ├── AsyncConfig.java
 │       │       │   ├── DataSourceConfig.java
-│       │       │   ├── SpringAIConfig.java
+│       │       │   ├── GroqConfig.java          (WebClient bean for Groq)
 │       │       │   ├── RedisConfig.java
 │       │       │   └── OpenApiConfig.java
 │       │       ├── api/
@@ -1358,13 +1436,18 @@ services:
       ANALYTICS_INTROSPECT_USERNAME: querysense_introspect
       ANALYTICS_INTROSPECT_PASSWORD: ${ANALYTICS_INTROSPECT_PASSWORD}
       REDIS_HOST: redis
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      MODEL_SQL: ${MODEL_SQL:-llama-3.3-70b-versatile}
+      MODEL_EXPLANATION: ${MODEL_EXPLANATION:-llama-3.3-70b-versatile}
+      OLLAMA_BASE_URL: http://ollama:11434
     depends_on:
       postgres-app:
         condition: service_healthy
       postgres-analytics:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
 
   postgres-app:
@@ -1415,10 +1498,25 @@ services:
       timeout: 3s
       retries: 5
 
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Pull the embedding model on first start
+    # Run manually once: docker exec querysense-ollama-1 ollama pull bge-small-en-v1.5
+
 volumes:
   postgres_app_data:
   postgres_analytics_data:
   redis_data:
+  ollama_data:
 ```
 
 **Dockerfile (corrected — uses mvnw):**
