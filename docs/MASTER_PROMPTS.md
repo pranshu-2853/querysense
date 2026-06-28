@@ -25,7 +25,7 @@ TECHNOLOGY STACK (authoritative — do not deviate):
 - Framework: Spring Boot 3.3.x
 - AI Framework: Spring AI 1.0.0 (used for Ollama embeddings only — inject EmbeddingModel, NOT ChatClient or ChatClient.Builder)
 - LLM Client: Groq API via Spring WebClient (OpenAI-compatible REST) — NOT OpenAI SDK, NOT spring-ai-openai-starter
-- Embedding: Ollama local (BAAI/bge-small-en-v1.5, 384 dims) — runs in Docker, zero recurring API cost
+- Embedding: Ollama local (nomic-embed-text, 768 dims) — runs in Docker, zero recurring API cost
 - Build: Maven 3.9.x with Maven Wrapper (mvnw)
 - AST Validation: JSQLParser 4.9
 - Application DB: PostgreSQL 16 with pgvector extension (pgvector/pgvector:pg16 image)
@@ -55,7 +55,7 @@ AI PROVIDER API (critical):
 - SQL generation: blocking WebClient call, parse JSON response manually, deserialize to SQLGenerationResult record
 - Streaming explanation: WebClient bodyToFlux(String.class) with stream:true, parse SSE lines manually
 - Embeddings: Spring AI OllamaEmbeddingModel — inject EmbeddingModel (not EmbeddingClient), call embedForResponse(List.of(text))
-- Vector dimensions: BGE-small = 384 — all vector columns must be vector(384), NOT vector(1536)
+- Vector dimensions: nomic-embed-text = 768 — all vector columns must be vector(768), NOT vector(1536)
 
 SSE LIFECYCLE:
 - SseEmitter timeout: 120_000ms
@@ -312,7 +312,7 @@ IMPLEMENTATION RULES:
 - Generate each migration file exactly as defined in the architecture database design section
 - V15__create_pgvector_extension.sql must contain ONLY: CREATE EXTENSION IF NOT EXISTS vector;
 - This extension is enabled on the application DB (querysense), which uses the pgvector/pgvector:pg16 Docker image — it is already available, just needs to be created
-- V16–V18 define table_embeddings, column_embeddings, question_embeddings — use vector(384) type (BGE-small-en-v1.5 = 384 dims)
+- V16–V18 define table_embeddings, column_embeddings, question_embeddings — use vector(768) type (nomic-embed-text = 768 dims)
 - V16–V18 must also include the HNSW index CREATE INDEX statements (WITH m=16, ef_construction=64, vector_cosine_ops)
 - V19 contains all relational indexes from the architecture — copy exactly
 - Migrations must be idempotent where possible (use IF NOT EXISTS)
@@ -322,7 +322,7 @@ VALIDATION REQUIREMENTS:
 - ./mvnw compile -q passes
 - docker compose down -v && docker compose up — Flyway must run V1–V19 successfully
 - SELECT count(*) FROM information_schema.tables WHERE table_schema='public' in querysense DB returns 19 tables
-- \d table_embeddings in psql shows embedding column as vector(384)
+- \d table_embeddings in psql shows embedding column as vector(768)
 - SELECT * FROM pg_indexes WHERE tablename='table_embeddings' shows the HNSW index
 
 STOPPING POINT: Migrations only. Do not begin AI client or pipeline work.
@@ -368,10 +368,10 @@ IMPLEMENTATION RULES FOR SQLGenerationResult:
 
 IMPLEMENTATION RULES FOR EmbeddingClientWrapper:
 - Inject EmbeddingModel (Spring AI OllamaEmbeddingModel — auto-configured from spring-ai-ollama-spring-boot-starter)
-- The model is bge-small-en-v1.5 (384 dims) running locally in Ollama Docker container
+- The model is nomic-embed-text (768 dims) running locally in Ollama Docker container
 - embed(String text): returns float[] from embeddingModel.embedForResponse(List.of(text)).getResults().get(0).getOutput()
 - embedToList(String text): returns List<Double> (for pgvector JDBC insert compatibility)
-- IMPORTANT: all vector columns are vector(384) — do NOT pass 1536-element arrays
+- IMPORTANT: all vector columns are vector(768) — do NOT pass 1536-element arrays
 
 IMPLEMENTATION RULES FOR SchemaEmbeddingService:
 - embedAllTables(): for each whitelisted registered_table, build embed_content string as "table_name: {name}\ndescription: {desc}\ncolumns: {col1 (type), col2 (type)...}", call EmbeddingClientWrapper.embed(), upsert into table_embeddings
@@ -808,7 +808,7 @@ IMPLEMENTATION RULES FOR CI:
 - Jobs: postgres-app (pgvector/pgvector:pg16), postgres-analytics (postgres:16-alpine), redis (redis:7-alpine) as service containers
 - Steps: checkout, setup-java (21, temurin, maven cache), setup analytics DB roles and schema (psql commands), run ./mvnw verify, upload surefire-reports as artifact
 - Use github.com secrets for GROQ_API_KEY (Groq free tier — no cost in CI)
-- Add ollama as a service container: image ollama/ollama:latest, pull bge-small-en-v1.5 as a setup step
+- Add ollama as a service container: image ollama/ollama:latest, pull nomic-embed-text as a setup step
 - After ./mvnw verify: run python evaluate.py --fail-below 0.80 (fails build if accuracy < 80%)
 - deploy.yml: runs only after ci.yml passes on main branch, deploys to Railway
 
@@ -843,6 +843,6 @@ When reviewing AI-generated code, immediately reject and redirect if you see:
 | `PipelineContext` stored in a static field | Thread-safety violation | One instance per async task, never stored statically |
 | Raw string concatenation for LIMIT injection | SQL injection risk | Use JSQLParser API to modify AST |
 | `spring-ai-openai-spring-boot-starter` in pom.xml | Paid OpenAI dependency | Use `spring-ai-ollama-spring-boot-starter` + WebClient for Groq |
-| `vector(1536)` in migrations | Wrong dimension for BGE | BGE-small-en-v1.5 = 384 dims — use `vector(384)` |
+| `vector(1536)` in migrations | Wrong dimension for BGE | nomic-embed-text = 768 dims — use `vector(768)` |
 | OPENAI_API_KEY in env | OpenAI cost | Use `GROQ_API_KEY` + `OLLAMA_BASE_URL` |
 | Missing `@Transactional` on AuditService write methods | Non-atomic audit writes | Add @Transactional |

@@ -269,7 +269,7 @@ ESTIMATED TIME: 1–2 days
 DEFINITION OF DONE:
   - docker compose down -v && docker compose up runs V1–V19 successfully
   - 19 tables exist in querysense DB
-  - table_embeddings has a vector(384) column (BGE-small-en-v1.5 = 384 dims)
+  - table_embeddings has a vector(768) column (nomic-embed-text = 768 dims)
   - HNSW index exists on all three embedding tables
   - pgvector extension is active: SELECT * FROM pg_extension WHERE extname = 'vector' returns a row
 
@@ -290,8 +290,8 @@ FILES INVOLVED:
 MANUAL VERIFICATION CHECKLIST:
   [ ] docker compose down -v && docker compose up — Flyway shows 19 migrations applied
   [ ] SELECT count(*) FROM information_schema.tables WHERE table_schema='public' = 19
-  [ ] \d table_embeddings shows embedding column as vector(384)
-  [ ] \d column_embeddings shows embedding column as vector(384)
+  [ ] \d table_embeddings shows embedding column as vector(768)
+  [ ] \d column_embeddings shows embedding column as vector(768)
   [ ] SELECT indexname FROM pg_indexes WHERE tablename='table_embeddings' shows HNSW index
   [ ] SELECT * FROM pg_extension WHERE extname='vector' returns a row
   [ ] All foreign key constraints exist (SELECT * FROM information_schema.referential_constraints)
@@ -303,15 +303,15 @@ TESTING CHECKLIST:
 COMMON PITFALLS:
   - V15 trying to CREATE EXTENSION vector on postgres-analytics DB (wrong — only app DB has pgvector image)
   - HNSW index CREATE failing because vector extension not yet enabled (V15 must come before V16–V18)
-  - vector(1536) column type: BGE-small-en-v1.5 produces 384-dim vectors — all migrations must use vector(384)
-  - vector(384) column type not recognized if pgvector extension not installed in Docker image
+  - vector(1536) column type: nomic-embed-text produces 768-dim vectors — all migrations must use vector(768)
+  - vector(768) column type not recognized if pgvector extension not installed in Docker image
 
 INTERVIEW CONCEPTS LEARNED:
   - pgvector HNSW vs IVFFlat index tradeoffs
   - Why HNSW is better for small-to-medium datasets (online indexing, no training phase)
   - Flyway migration ordering and naming conventions
   - PostgreSQL extensions system
-  - Embedding dimension is model-dependent: BGE-small=384, bge-base=768, nomic-embed=768 — keep it in config not hardcoded
+  - Embedding dimension is model-dependent: nomic-embed-text=768 — keep it in config not hardcoded; never hardcode the number
 
 DEPENDENCIES: Phase 04
 
@@ -347,7 +347,7 @@ FILES INVOLVED:
   src/test/java/com/querysense/schema/DdlReconstructionServiceTest.java
 
 MANUAL VERIFICATION CHECKLIST:
-  [ ] Ollama is running and bge-small-en-v1.5 is pulled: curl http://localhost:11434/api/tags shows the model
+  [ ] Ollama is running and nomic-embed-text is pulled: curl http://localhost:11434/api/tags shows the model
   [ ] POST /api/v1/schema/sync (with real GROQ_API_KEY in .env) → runs without error
   [ ] SELECT count(*) FROM table_embeddings > 0 after sync
   [ ] SELECT count(*) FROM column_embeddings > 0 after sync
@@ -361,8 +361,8 @@ TESTING CHECKLIST:
   [ ] DdlReconstructionServiceTest: given RetrievedSchemaContext with 2 tables, verify DDL contains both table names and all column names
 
 COMMON PITFALLS:
-  - Forgetting to pull BGE model: docker exec <ollama> ollama pull bge-small-en-v1.5 (must be done once before first embedding call)
-  - Using vector(1536) in migrations — BGE-small-en-v1.5 is 384 dims, not 1536
+  - Forgetting to pull model: docker exec <ollama> ollama pull nomic-embed-text (must be done once before first embedding call)
+  - Using vector(1536) in migrations — nomic-embed-text is 768 dims, not 1536
   - Groq JSON parsing: model wraps SQL in ```json fences — strip before ObjectMapper.readValue
   - WebClient streaming: filter "data: [DONE]" sentinel lines before JSON parsing
   - pgvector JDBC insert: float[] from embedding model must be cast correctly — use ::vector cast in SQL
@@ -372,7 +372,7 @@ INTERVIEW CONCEPTS LEARNED:
   - Groq as the default provider — environment-variable-driven model selection means zero-code provider switch
   - Local embedding models (Ollama + BGE) vs cloud embeddings: cost vs convenience tradeoff
   - Structured LLM output with manual JSON parsing (resilient to model formatting variation)
-  - BGE-small-en-v1.5: 384-dim, high quality, runs on CPU — ideal for schema embeddings; dimension is model-dependent, kept in config
+  - nomic-embed-text: 768-dim, high quality, runs on CPU — ideal for schema embeddings; dimension is model-dependent, kept in config
   - pgvector JDBC insertion pattern
 
 DEPENDENCIES: Phase 05
@@ -939,10 +939,10 @@ A: Groq exposes an OpenAI-compatible REST API, so the prompt engineering is
 
 Q: Why Ollama for embeddings instead of OpenAI text-embedding-3-small?
 A: Schema embeddings happen only during schema sync — an infrequent, offline
-   operation. Running BAAI/bge-small-en-v1.5 locally via Ollama eliminates the
-   entire embedding API cost. BGE-small produces 384-dimensional vectors with
+   operation. Running nomic-embed-text locally via Ollama eliminates the
+   entire embedding API cost. nomic-embed-text produces 768-dimensional vectors with
    quality comparable to OpenAI's small embedding model for English text retrieval.
-   The only change is the vector column dimensions (384 vs 1536) and the Docker
+   The only change is the vector column dimensions (768 vs 1536) and the Docker
    service — all pipeline logic stays identical.
 
 Q: Why Spring AI 1.0.x and not LangChain4j?

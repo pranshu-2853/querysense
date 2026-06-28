@@ -363,8 +363,8 @@ public class SseEmitterRegistry {
 > **Default Provider:** Groq (chat/SQL/explanation) + Ollama local (embeddings)
 > **Cost:** $0 recurring API cost — Groq free tier + Ollama runs locally in Docker
 > **Groq API:** OpenAI-compatible REST at `https://api.groq.com/openai/v1` — no OpenAI SDK needed
-> **Embedding model:** `bge-small-en-v1.5` via Ollama — 384 dimensions, runs locally, no API cost
-> **Embedding dimension:** Controlled by `EMBEDDING_MODEL` env var. Default `bge-small-en-v1.5` = **384 dims**. If you switch to `bge-base-en-v1.5` (768) or `nomic-embed-text` (768), update `EMBEDDING_DIMENSION` and re-run migrations. Do not hardcode 384 in application logic — read from config.
+> **Embedding model:** `nomic-embed-text` via Ollama — 768 dimensions, runs locally, no API cost
+> **Embedding dimension:** Controlled by `EMBEDDING_MODEL` env var. Default `nomic-embed-text` = **768 dims**. Update `EMBEDDING_DIMENSION` in config if you ever switch models and re-run migrations. Do not hardcode 384 in application logic — read from config.
 > **Model fallback:** All model names are environment variables (`MODEL_SQL`, `MODEL_EXPLANATION`). Switching providers or models requires only a config change, no code change.
 
 **Dependency (pom.xml):**
@@ -387,7 +387,7 @@ public class SseEmitterRegistry {
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-webflux</artifactId>
     </dependency>
-    <!-- Ollama for local embeddings (BAAI/bge-small-en-v1.5) -->
+    <!-- Ollama for local embeddings (nomic-embed-text) -->
     <dependency>
         <groupId>org.springframework.ai</groupId>
         <artifactId>spring-ai-ollama-spring-boot-starter</artifactId>
@@ -408,7 +408,7 @@ spring:
       base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
       embedding:
         options:
-          model: ${EMBEDDING_MODEL:bge-small-en-v1.5}
+          model: ${EMBEDDING_MODEL:nomic-embed-text}
 
 app:
   ai:
@@ -513,14 +513,14 @@ public class LLMClient {
 }
 ```
 
-**EmbeddingClient wrapper — Ollama local embeddings (BAAI/bge-small-en-v1.5):**
+**EmbeddingClient wrapper — Ollama local embeddings (nomic-embed-text):**
 ```java
 @Component
 public class EmbeddingClientWrapper {
 
     // Spring AI OllamaEmbeddingModel — connects to local Ollama instance
-    // Model: bge-small-en-v1.5 produces 384-dimension vectors (FREE, local, fast)
-    // Pull once: ollama pull bge-small-en-v1.5
+    // Model: nomic-embed-text produces 768-dimension vectors (FREE, local, fast)
+    // Pull once: ollama pull nomic-embed-text
     private final EmbeddingModel embeddingModel;
 
     public EmbeddingClientWrapper(EmbeddingModel embeddingModel) {
@@ -541,8 +541,8 @@ public class EmbeddingClientWrapper {
 }
 ```
 
-> **Note on vector dimensions:** BGE-small-en-v1.5 produces **384-dimension** vectors, not 1536.
-> The Flyway migration `V16–V18` must use `vector(384)` instead of `vector(1536)`.
+> **Note on vector dimensions:** nomic-embed-text produces **768-dimension** vectors, not 1536.
+> The Flyway migration `V16–V18` must use `vector(768)` instead of `vector(1536)`.
 > See the updated migration note in Section 12.
 
 ---
@@ -737,7 +737,7 @@ CREATE TABLE table_embeddings (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     table_id      UUID NOT NULL REFERENCES registered_tables(id) ON DELETE CASCADE,
     embed_content TEXT NOT NULL,
-    embedding     vector(384) NOT NULL,   -- BGE-small-en-v1.5 = 384 dims
+    embedding     vector(768) NOT NULL,   -- nomic-embed-text = 768 dims
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(table_id)
 );
@@ -752,7 +752,7 @@ CREATE TABLE column_embeddings (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     column_id     UUID NOT NULL REFERENCES registered_columns(id) ON DELETE CASCADE,
     embed_content TEXT NOT NULL,
-    embedding     vector(384) NOT NULL,   -- BGE-small-en-v1.5 = 384 dims
+    embedding     vector(768) NOT NULL,   -- nomic-embed-text = 768 dims
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(column_id)
 );
@@ -766,7 +766,7 @@ CREATE INDEX idx_column_embeddings_hnsw
 CREATE TABLE question_embeddings (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_id        UUID NOT NULL REFERENCES query_jobs(id) ON DELETE CASCADE,
-    embedding     vector(384) NOT NULL,   -- BGE-small-en-v1.5 = 384 dims
+    embedding     vector(768) NOT NULL,   -- nomic-embed-text = 768 dims
     cached_sql    TEXT,
     cached_result JSONB,
     cache_valid   BOOLEAN NOT NULL DEFAULT true,
@@ -1191,7 +1191,7 @@ GET    /actuator/metrics
 | Analytics DB | PostgreSQL | 16 (postgres:16-alpine image) |
 | SQL Generation | Groq (llama-3.3-70b-versatile) | via WebClient |
 | Explanation | Groq (llama-3.3-70b-versatile) | via WebClient |
-| Embeddings | BAAI/bge-small-en-v1.5 | via Ollama (local) |
+| Embeddings | nomic-embed-text | via Ollama (local) |
 | Resilience | Resilience4j | via Spring Boot starter |
 | Testing | JUnit 5 + Mockito + Testcontainers | — |
 | Containerization | Docker + Docker Compose | — |
@@ -1510,7 +1510,7 @@ services:
       timeout: 5s
       retries: 5
     # Pull the embedding model on first start
-    # Run manually once: docker exec querysense-ollama-1 ollama pull bge-small-en-v1.5
+    # Run manually once: docker exec querysense-ollama-1 ollama pull nomic-embed-text
 
 volumes:
   postgres_app_data:
