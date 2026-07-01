@@ -1,0 +1,89 @@
+spring:
+  application:
+    name: querysense
+
+  # --- DataSources ---
+  datasource:
+    app:
+      url: ${APP_DB_URL}
+      username: ${APP_DB_USERNAME}
+      password: ${APP_DB_PASSWORD}
+      driver-class-name: org.postgresql.Driver
+      hikari:
+        pool-name: AppPool
+        maximum-pool-size: 10
+        minimum-idle: 2
+    analytics:
+      url: ${ANALYTICS_DB_URL}
+      username: ${ANALYTICS_DB_USERNAME}
+      password: ${ANALYTICS_DB_PASSWORD}
+      driver-class-name: org.postgresql.Driver
+      hikari:
+        pool-name: AnalyticsPool
+        maximum-pool-size: 5
+        minimum-idle: 1
+    introspect:
+      url: ${ANALYTICS_DB_URL}
+      username: ${ANALYTICS_INTROSPECT_USERNAME}
+      password: ${ANALYTICS_INTROSPECT_PASSWORD}
+      driver-class-name: org.postgresql.Driver
+      hikari:
+        pool-name: IntrospectPool
+        maximum-pool-size: 2
+        minimum-idle: 1
+
+  # --- JPA ---
+  jpa:
+    hibernate:
+      ddl-auto: none
+    open-in-view: false
+
+  # --- Flyway (auto-configures from @Primary DataSource — no flyway.url/username/password) ---
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  # --- Redis ---
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+  # --- Spring AI ---
+  ai:
+    ollama:
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
+      embedding:
+        options:
+          model: ${EMBEDDING_MODEL:nomic-embed-text}
+    vectorstore:
+      pgvector:
+        initialize-schema: false
+
+# --- Groq AI Configuration ---
+app:
+  ai:
+    provider: groq
+    groq:
+      api-key: ${GROQ_API_KEY}
+      base-url: https://api.groq.com/openai/v1
+    model:
+      sql: ${MODEL_SQL:llama-3.3-70b-versatile}
+      explanation: ${MODEL_EXPLANATION:llama-3.3-70b-versatile}
+      temperature-sql: 0.0
+      temperature-explanation: 0.3
+      max-tokens: 1000
+
+# --- Actuator ---
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
+  endpoint:
+    health:
+      show-details: always
+
+# --- Server ---
+server:
+  port: 8080

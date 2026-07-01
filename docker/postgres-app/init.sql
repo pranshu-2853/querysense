@@ -1,0 +1,7 @@
+-- QuerySense Application Database Initialization
+-- This script runs once when the postgres-app container is first created.
+-- The database and user are created automatically by the PostgreSQL Docker image
+-- via POSTGRES_DB and POSTGRES_USER environment variables.
+--
+-- NOTE: Do NOT create the pgvector extension here.
+-- Flyway migration V15__create_pgvector_extension.sql handles it.

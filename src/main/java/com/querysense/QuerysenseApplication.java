@@ -4,10 +4,10 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 @SpringBootApplication
-public class QuerysenseApplication {
+public class QuerySenseApplication {
 
-	public static void main(String[] args) {
-		SpringApplication.run(QuerysenseApplication.class, args);
-	}
+    public static void main(String[] args) {
+        SpringApplication.run(QuerySenseApplication.class, args);
+    }
 
 }

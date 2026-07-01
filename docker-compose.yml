@@ -1,0 +1,97 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      APP_DB_URL: jdbc:postgresql://postgres-app:5432/querysense
+      APP_DB_USERNAME: querysense
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      ANALYTICS_DB_URL: jdbc:postgresql://postgres-analytics:5432/analytics
+      ANALYTICS_DB_USERNAME: querysense_readonly
+      ANALYTICS_DB_PASSWORD: ${ANALYTICS_READONLY_PASSWORD}
+      ANALYTICS_INTROSPECT_USERNAME: querysense_introspect
+      ANALYTICS_INTROSPECT_PASSWORD: ${ANALYTICS_INTROSPECT_PASSWORD}
+      REDIS_HOST: redis
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      MODEL_SQL: ${MODEL_SQL:-llama-3.3-70b-versatile}
+      MODEL_EXPLANATION: ${MODEL_EXPLANATION:-llama-3.3-70b-versatile}
+      OLLAMA_BASE_URL: http://ollama:11434
+    depends_on:
+      postgres-app:
+        condition: service_healthy
+      postgres-analytics:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+
+  postgres-app:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: querysense
+      POSTGRES_USER: querysense
+      POSTGRES_PASSWORD: ${APP_DB_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_app_data:/var/lib/postgresql/data
+      - ./docker/postgres-app/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U querysense"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres-analytics:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: analytics
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${ANALYTICS_SUPERUSER_PASSWORD}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_analytics_data:/var/lib/postgresql/data
+      - ./docker/postgres-analytics/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./docker/postgres-analytics/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Pull the embedding model on first start:
+    # docker exec querysense-ollama-1 ollama pull nomic-embed-text
+
+volumes:
+  postgres_app_data:
+  postgres_analytics_data:
+  redis_data:
+  ollama_data:

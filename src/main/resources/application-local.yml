@@ -1,0 +1,44 @@
+# Local development profile
+# Credentials match docker-compose and docker/postgres-analytics/init.sql defaults.
+
+spring:
+  datasource:
+    app:
+      url: jdbc:postgresql://localhost:5432/querysense
+      username: querysense
+      password: querysense_secret
+    analytics:
+      url: jdbc:postgresql://localhost:5433/analytics
+      username: querysense_readonly
+      password: readonly_password
+    introspect:
+      url: jdbc:postgresql://localhost:5433/analytics
+      username: querysense_introspect
+      password: introspect_password
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  ai:
+    ollama:
+      base-url: http://localhost:11434
+
+  # Default security credentials for local development.
+  # Phase 03 replaces this with JWT-based SecurityConfig.
+  security:
+    user:
+      name: admin
+      password: admin
+
+app:
+  ai:
+    groq:
+      api-key: ${GROQ_API_KEY}
+      base-url: https://api.groq.com/openai/v1
+
+logging:
+  level:
+    com.querysense: DEBUG
+    org.flywaydb: INFO
